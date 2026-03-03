@@ -17,9 +17,13 @@ Camera: Intel RealSense D435i
     RGB native: 1920x1080 (16:9)
     Depth native: 1280x720 (16:9)
     Downsampled to 160x90 preserving 16:9 aspect ratio.
+
+NOTE: This environment is ROS2-coupled and intended for real robot deployment or live Isaac Sim integration tests.
+      For training, a direct-API environment (using omni.isaac.lab) should be used instead to avoid middleware artifacts
+      (message latency, serialization jitter, queue saturation) that undermien sim-to-real transfer.
 Author: Aaron
 Date: 02/12/26
-Updated: 02/17/26
+Updated: 03/02/26
 """
 
 import numpy as np
@@ -35,11 +39,14 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 import time
 import cv2
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     from lane_detector import SimpleLaneDetector
 except ImportError:
-    print("Warning: lane_detector not found, lane rewards will be disabled")
+    logger.warning("lane_detector not found, lane rewards will be disabled")
     SimpleLaneDetector = None
 
 
@@ -53,7 +60,7 @@ class IsaacROS2Config:
 
     # ROS2 topic names
     camera_topic: str = "/camera/image_raw"
-    state_topic: str = "/vehicle_state" # AckermannDriveStamped from controller 
+    state_topic: str = "/vehicle_state" # AckermannDriveStamped from controller
     control_topic: str = "/ackermann_cmd"
 
     # Control limits
@@ -69,6 +76,9 @@ class IsaacROS2Config:
     goal_x: float = 10.0
     goal_y: float = 0.0
     goal_z: float = 0.0
+
+    # Vehicle parameters
+    wheelbase:float = 0.33 # meters, RACECAR wheelbase for bycycle model
 
 
 class IsaacROS2Env(gym.Env):
@@ -109,6 +119,10 @@ class IsaacROS2Env(gym.Env):
         self.current_steering: float = 0.0
         self.current_acceleration: float = 0.0
         self.last_action = np.zeros(3, dtype=np.float32)
+
+        # Navigation command - must be set externally by high-level planner or randomized during
+        # randomized during training curriculum to exercise kinematic anchors
+        self.turn_bias: float = 0.0
 
         # Episode tracking
         self.episode_start_time: float = 0.0
@@ -176,9 +190,23 @@ class IsaacROS2Env(gym.Env):
         self.node.get_logger().info(f"  State: {self.config.state_topic}")
         self.node.get_logger().info(f"  Control: {self.config.control_topic}")
 
+    def set_turn_bias(self, bias: float) -> None:
+        """
+        Set the high-level navifatio ncommand.
+
+        This should be called by a route planner, waypoint graph, or randomized curriculum to tell the agent which direction
+        to go at intersections.
+
+        Args:
+            bias: Continuous turn command [-1, 1].
+                -1 = hard left, 0 = straight, 1 = hard right.
+        """
+        self.turn_bias = np.clip(bias, -1.0, 1.0)
+
     def _camera_callback(self, msg: Image):
         """Process camera image."""
-        print(f"DEBUG: Camera Callback Triggered. Encoding: {msg.encoding}") 
+        # FIX: removed debug print statements that fired every frame.
+        # Use ROS2 logger at debug level instead for when we actually need it.
         try:
             # Convert ROS Image to numpy array
             cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
@@ -191,7 +219,6 @@ class IsaacROS2Env(gym.Env):
                 )
 
             self.latest_image = cv_image
-            print("DEBUG: Image processed successfully")
 
         except Exception as e:
             self.node.get_logger().error(f"Camera callback error: {e}")
@@ -237,11 +264,8 @@ class IsaacROS2Env(gym.Env):
 
         # Compute yaw rate from bicycle model
         # yaw_rate = (v / L) * tan(steering_angle)
-        # For small angles: yaw_rate squigeq (v / L) * steering_angle
-        # Assume wheelbase L squigeq 0.33m for RACECAR
-        wheelbase = 0.33 # meters
         if abs(self.current_speed) > 0.01:
-            yaw_rate = (self.current_speed / wheelbase) * np.tan(self.current_steering)
+            yaw_rate = (self.current_speed / self.config.wheelbase) * np.tan(self.current_steering)
         else:
             yaw_rate = 0.0
 
@@ -264,7 +288,21 @@ class IsaacROS2Env(gym.Env):
 
         return {'image': image, 'vec': vec}
 
-    def _compute_reward(self, obs: Dict[str, np.ndarray]) -> float:
+    def _detect_lane(self, image: np.ndarray):
+        """
+        Run lane detection once and return the result.
+
+        FIX: Previously, both _compute_reward() and _check_termination() called self.lane_detector.detect() independently,
+             doubling the CV cost per step. Now we call it once in step() and pass the result to both.
+
+        Returns:
+            Lane detection result, or None if lane detector is unavailable.
+        """
+        if self.lane_detector is not None:
+            return self.lane_detector.detect(image)
+        return None
+
+    def _compute_reward(self, obs: Dict[str, np.ndarray], lane_result=None) -> float:
         """
         Compute reward using ONLY visual information and speed.
 
@@ -272,12 +310,15 @@ class IsaacROS2Env(gym.Env):
         1. Lane staying (from vision)
         2. Speed reward  (encourage forward motion)
         3. Smoothness penalties
+
+        Args:
+            obs: Current observation dict.
+            lane_result: Pre-computed lane detection result (avoids duplicate detection).
         """
         reward = 0.0
 
         # 1. Lane staying reward (vision-based)
-        if self.lane_detector is not None:
-            lane_result = self.lane_detector.detect(obs['image'])
+        if lane_result is not None:
             if lane_result.in_lane:
                 reward += 1 # In lane
             else:
@@ -299,7 +340,7 @@ class IsaacROS2Env(gym.Env):
 
         return reward
 
-    def _check_termination(self, obs: Dict[str, np.ndarray]) -> Tuple[bool, bool, Dict]:
+    def _check_termination(self, obs: Dict[str, np.ndarray], lane_result=None) -> Tuple[bool, bool, Dict]:
         """
         Check if episode should terminate.
 
@@ -307,6 +348,10 @@ class IsaacROS2Env(gym.Env):
         1. Timeout
         2. Off track (vision-based)
         3. Stuck (low speed for too long)
+
+        Args:
+            obs: Current observation dict.
+            lane_result: Pre-computed lane detection result (avoids duplicate detection).
         """
         info = {}
         done = False
@@ -319,8 +364,7 @@ class IsaacROS2Env(gym.Env):
             info['termination_reason'] = 'timeout'
 
         # Check if off track (vision-based)
-        if self.lane_detector is not None:
-            lane_result = self.lane_detector.detect(obs['image'])
+        if lane_result is not None:
             if abs(lane_result.lateral_offset) > 0.8:
                 done = True
                 info['termination_reason'] = 'off_track'
@@ -354,6 +398,9 @@ class IsaacROS2Env(gym.Env):
         self.total_distance = 0.0
         self.last_update_time = time.time()
         self.stuck_timer = 0.0
+
+        # Note: turn_bias is NOT reset here - it should be set externally by the training curriculum
+        #       or route planner before each episode.
 
         # Send zero command
         cmd = AckermannDrive()
@@ -394,19 +441,21 @@ class IsaacROS2Env(gym.Env):
         dt = time.time() - self.last_update_time
         self.total_distance += self.current_speed * dt
 
-        # Compute reward
-        reward = self._compute_reward(obs)
+        # Run lane deteciton ONCE and share the result
+        lane_result = self._detect_lane(obs['image'])
 
-        # Check termination
-        done, truncated, info = self._check_termination(obs)
+        # Compute reward (using shared lane result)
+        reward = self._compute_reward(obs, lane_result=lane_result)
+
+        # Check termination (using shared lane result)
+        done, truncated, info = self._check_termination(obs, lane_result=lane_result)
 
         # Add metrics to info
         speed = obs['vec'][3]
         info['speed'] = speed
         info['total_distance'] = self.total_distance
 
-        if self.lane_detector is not None:
-            lane_result = self.lane_detector.detect(obs['image'])
+        if lane_result is not None:
             info['in_lane'] = lane_result.in_lane
             info['lateral_offset'] = lane_result.lateral_offset
 

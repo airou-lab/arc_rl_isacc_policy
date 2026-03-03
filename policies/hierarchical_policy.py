@@ -143,7 +143,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         self.waypoint_dim = num_waypoints * 2 # (x, y) per waypoint
         self.waypoint_horizon = waypoint_horizon
         self.repulsion_weight = repulsion_weight
-        self.waypoint_loss_Weight = waypoint_loss_weight
+        self.waypoint_loss_weight = waypoint_loss_weight
 
         # Kinematic anchor config
         self.use_kinematic_anchors = use_kinematic_anchors
@@ -200,7 +200,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
             )
 
         if self.enable_critic_lstm and self.lstm_critic.input_size != self.features_dim:
-            self.lstm_criric = nn.LSTM(
+            self.lstm_critic = nn.LSTM(
                 self.features_dim,
                 self.lstm_hidden_size,
                 num_layers=self.n_lstm_layers,
@@ -445,7 +445,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
             lstm_states = RNNStates(pi=lstm_states, vf=lstm_states)
 
         features = self.extract_features(obs)
-        latent_pi, lstm_sates_pi = self._process_sequence(features, lstm_states.pi, episode_starts, self.lstm_actor)
+        latent_pi, lstm_states_pi = self._process_sequence(features, lstm_states.pi, episode_starts, self.lstm_actor)
 
         if self.mlp_extractor is not None:
             latent_pi = self.mlp_extractor.forward_actor(latent_pi)
@@ -476,7 +476,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         else:
             _, vf_features = features
 
-        if self.enalbe_critic_lstm:
+        if self.enable_critic_lstm:
             latent_vf, _ = self._process_sequence(vf_features, lstm_states, episode_starts, self.lstm_critic)
         else:
             latent_vf = vf_features
@@ -510,11 +510,11 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
                 if isinstance(obs_tensor, dict) and "image" in obs_tensor:
                     img = obs_tensor["image"]
                     batch_size = img.shape[0] if img.ndim > 3 else 1
-                state = self.get_initial_states(base_size)
+                state = self.get_initial_states(batch_size)
 
             if episode_start is None:
                 episode_start = np.array([False])
-            episode_starts_tensor = torch.Tensor(episode_start, dtype=torch.float32, device=self.device)
+            episode_starts_tensor = torch.tensor(episode_start, dtype=torch.float32, device=self.device)
 
             features = self.extract_features(obs_tensor)
             if self.share_features_extractor:
@@ -530,7 +530,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
             obs_vec = (
                 obs_tensor["vec"] if isinstance(obs_tensor, dict) else obs_tensor
             )
-            waypoints = seld._compute_waypoints(latent_pi, obs_vec)
+            waypoints = self._compute_waypoints(latent_pi, obs_vec)
 
             new_state = RNNStates(pi=new_lstm_states_pi, vf=state.vf)
             return waypoints, new_state
