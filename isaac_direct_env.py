@@ -29,7 +29,7 @@ Action space:
     Box(3,) float32: [steering, throttle, brake] each in [-1, 1]
     Internally converted to Ackermann geometry for the F1Tenth joints.
 
-Vehicle parameters (from Arika's launch_isaac_ros2.py Action Graph):
+Vehicle parameters (from launch_isaac_ros2.py Action Graph):
     Robot prim:     /World/F1Tenth
     Wheelbase:      0.33 m
     Track width:    0.28 m
@@ -41,8 +41,8 @@ Vehicle parameters (from Arika's launch_isaac_ros2.py Action Graph):
 Camera:
     Intel RealSense D435i equivalent in sim.
     Resolution: 160x90 (16:9, downsampled from native).
-    Camera prim path must be configured — it depends on how Arika
-    attached the camera to the F1Tenth URDF. Common locations:
+    Camera prim path must be configured — it depends on how
+    the camera is attached to the F1Tenth URDF. Common locations:
         /World/F1Tenth/chassis/Camera
         /World/F1Tenth/Camera
 
@@ -86,7 +86,7 @@ class IsaacDirectConfig:
     """
     Configuration for the direct-API Isaac Sim environment.
 
-    Vehicle geometry is taken directly from Arika's launch_isaac_ros2.py
+    Vehicle geometry is taken directly from launch_isaac_ros2.py
     Action Graph setup, which uses the F1Tenth standard dimensions.
     """
 
@@ -104,7 +104,7 @@ class IsaacDirectConfig:
     track_width: float = 0.28        # meters, left wheel to right wheel
     wheel_radius: float = 0.05       # meters
 
-    # Joint names (from Arika's Action Graph / URDF quick_inspect.py)
+    # Joint names (from Action Graph / URDF quick_inspect.py)
     steering_joints: Tuple[str, ...] = (
         "Knuckle__Upright__Front_Left",
         "Knuckle__Upright__Front_Right",
@@ -401,7 +401,7 @@ class IsaacDirectEnv(gym.Env):
                 f"  /World/F1Tenth/chassis/Camera\n"
                 f"  /World/F1Tenth/Camera\n"
                 f"  /World/F1Tenth/Cameras/front_camera\n"
-                f"Arika can check with: "
+                f"Can check with: "
                 f"omni.usd.get_context().get_stage().TraverseAll()"
             )
 

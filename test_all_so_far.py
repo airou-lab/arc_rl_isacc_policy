@@ -3,7 +3,7 @@ Smoke Test — Validate All Components
 ======================================
 
 Run from project root:
-    python test_all.py
+    python test_all_so_far.py
 
 Tests everything that doesn't require Isaac Sim to be running:
     1. Config layer (save/load/diff)
