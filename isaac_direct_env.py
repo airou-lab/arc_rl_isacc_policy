@@ -91,9 +91,9 @@ class IsaacDirectConfig:
     """
 
     # === Scene ===
-    usd_path: str = ""  # Path to USD stage. Empty = use currently loaded stage.
+    usd_path: str = "/home/arika/Documents/arcpro/arcpro_system/src/examples/ARCPro_RL/arc_rl_isacc_sim/openStreetUSD/arcpro_RL_open_street_sim.usd"
     robot_prim_path: str = "/World/F1Tenth"
-    camera_prim_path: str = "/World/F1Tenth/chassis/Camera"  # Adjust per actual USD
+    camera_prim_path: str = "/World/F1Tenth/Rigid_Bodies/Chassis/Camera_Left"  # Updated to confirmed path
 
     # === Camera ===
     img_width: int = 160
@@ -132,9 +132,9 @@ class IsaacDirectConfig:
 
     # === Reset ===
     # Spawn position for episode reset (world frame)
-    spawn_x: float = 0.0
-    spawn_y: float = 0.0
-    spawn_z: float = 0.05           # Slightly above ground to avoid collision
+    spawn_x: float = 10.0
+    spawn_y: float = 10.0
+    spawn_z: float = 15.2          # Near road surface in openStreetUSD
     spawn_yaw: float = 0.0          # radians
 
     # === Headless ===
@@ -268,10 +268,11 @@ class IsaacDirectEnv(gym.Env):
 
     metadata = {"render_modes": ["rgb_array"]}
 
-    def __init__(self, config: Optional[IsaacDirectConfig] = None):
+    def __init__(self, config: Optional[IsaacDirectConfig] = None, simulation_app=None):
         super().__init__()
 
         self.config = config or IsaacDirectConfig()
+        self._simulation_app = simulation_app
         self._step_count = 0
         self._episode_start_time = 0.0
 
@@ -324,18 +325,14 @@ class IsaacDirectEnv(gym.Env):
     def _setup_sim(self):
         """
         Initialize Isaac Sim handles: world, robot, camera.
-
-        Called lazily on first reset() so the SimulationApp is already
-        running when we access omni APIs. This avoids import-time
-        errors when the file is loaded outside Isaac Sim for syntax checks.
         """
         if self._sim_initialized:
             return
 
         # Isaac Sim imports (only available inside SimulationApp context)
-        from isaacsim.core.api import World
-        from isaacsim.core.utils.prims import get_prim_at_path, is_prim_path_valid
-        from isaacsim.core.api.robots import Robot
+        from omni.isaac.core import World
+        from omni.isaac.core.utils.prims import get_prim_at_path, is_prim_path_valid
+        from omni.isaac.core.robots import Robot
         import omni.usd
 
         # Load stage if specified
@@ -343,9 +340,12 @@ class IsaacDirectEnv(gym.Env):
             import os
             if os.path.exists(self.config.usd_path):
                 omni.usd.get_context().open_stage(self.config.usd_path)
-                logger.info(f"Loaded USD stage: {self.config.usd_path}")
+                # Wait for stage to open
+                for _ in range(100):
+                    if hasattr(self, "_simulation_app"):
+                        self._simulation_app.update()
             else:
-                logger.warning(f"USD not found: {self.config.usd_path}, using current stage")
+                logger.warning(f"USD not found: {self.config.usd_path}")
 
         # Create simulation world
         self._world = World(
@@ -353,33 +353,31 @@ class IsaacDirectEnv(gym.Env):
             rendering_dt=self.config.render_dt,
             stage_units_in_meters=1.0,
         )
+        # Gravity enabled
+        self._world.get_physics_context().set_gravity(-9.81)
 
         # Get robot articulation
         robot_path = self.config.robot_prim_path
         if not is_prim_path_valid(robot_path):
-            raise RuntimeError(
-                f"Robot prim not found at '{robot_path}'. "
-                f"Check that the USD stage is loaded and the F1Tenth model exists. "
-                f"You may need to adjust config.robot_prim_path."
-            )
+            raise RuntimeError(f"Robot prim not found at '{robot_path}'")
 
         self._robot_articulation = self._world.scene.add(
             Robot(prim_path=robot_path, name="f1tenth")
         )
-
-        # Setup camera via Replicator for zero-copy image capture
+        
+        # Setup camera via Replicator
         self._setup_camera()
 
-        # Initialize world (this loads physics, creates articulation handles)
+        # Initialize world
         self._world.reset()
-        self._sim_initialized = True
-
-        logger.info(
-            f"Isaac Direct Env initialized: "
-            f"robot={robot_path}, "
-            f"camera={self.config.camera_prim_path}, "
-            f"substeps={self.config.substeps}"
+        
+        # Apply stable gains to all DOFs
+        self._robot_articulation.get_articulation_controller().set_gains(
+            kps=1e4 * np.ones(self._robot_articulation.num_dof),
+            kds=1e3 * np.ones(self._robot_articulation.num_dof)
         )
+        
+        self._sim_initialized = True
 
     def _setup_camera(self):
         """
@@ -390,7 +388,7 @@ class IsaacDirectEnv(gym.Env):
         annotator.get_data() to get the latest frame as a numpy array.
         No ROS2, no serialization, no message queues.
         """
-        from isaacsim.core.utils.prims import is_prim_path_valid
+        from omni.isaac.core.utils.prims import is_prim_path_valid
         import omni.replicator.core as rep
 
         camera_path = self.config.camera_prim_path
@@ -665,29 +663,28 @@ class IsaacDirectEnv(gym.Env):
             wheel_angles: (2,) position targets for front steering joints.
             wheel_velocities: (4,) velocity targets for all drive joints.
         """
+        from omni.isaac.core.utils.types import ArticulationAction
         dc = self._robot_articulation.get_articulation_controller()
 
-        # Steering: position control on front knuckle joints
-        for i, joint_name in enumerate(self.config.steering_joints):
-            joint_idx = self._get_joint_index(joint_name)
-            if joint_idx is not None:
-                dc.apply_action(
-                    joint_positions={joint_idx: float(wheel_angles[i])}
-                )
+        # 1. Apply Steering (Position Control)
+        steering_indices = [self._get_joint_index(name) for name in self.config.steering_joints]
+        dc.apply_action(ArticulationAction(
+            joint_positions=wheel_angles,
+            joint_indices=steering_indices
+        ))
 
-        # Drive: velocity control on all four wheel joints
-        for i, joint_name in enumerate(self.config.drive_joints):
-            joint_idx = self._get_joint_index(joint_name)
-            if joint_idx is not None:
-                dc.apply_action(
-                    joint_velocities={joint_idx: float(wheel_velocities[i])}
-                )
+        # 2. Apply Drive (Velocity Control)
+        drive_indices = [self._get_joint_index(name) for name in self.config.drive_joints]
+        dc.apply_action(ArticulationAction(
+            joint_velocities=wheel_velocities,
+            joint_indices=drive_indices
+        ))
 
     def _reset_robot_pose(self):
         """
         Teleport the robot to spawn position and zero all velocities.
         """
-        from isaacsim.core.utils.rotations import euler_angles_to_quat
+        from omni.isaac.core.utils.rotations import euler_angles_to_quat
 
         position = np.array([
             self.config.spawn_x,
@@ -699,15 +696,21 @@ class IsaacDirectEnv(gym.Env):
             np.array([0.0, 0.0, self.config.spawn_yaw])
         )
 
+        print(f"[IsaacDirectEnv] Resetting robot to {position}")
         self._robot_articulation.set_world_pose(
             position=position,
             orientation=orientation,
         )
 
-        # Zero all joint velocities
+        # Reset joints to default USD state instead of pure zeros
+        # This prevents suspension/arm joints from exploding
         num_dof = self._robot_articulation.num_dof
+        # Try to get default positions if possible, otherwise use zeros
+        # but DON'T override everything if we don't have to.
+        # For F1Tenth, 0 is generally safe for steering/drive, but maybe not shocks.
+        
         self._robot_articulation.set_joint_velocities(np.zeros(num_dof))
-        self._robot_articulation.set_joint_positions(np.zeros(num_dof))
+        # self._robot_articulation.set_joint_positions(np.zeros(num_dof)) # ELIMINATED
 
     def _get_robot_position(self) -> np.ndarray:
         """Get robot world position as (3,) float64 array."""
@@ -775,20 +778,18 @@ class IsaacDirectEnv(gym.Env):
     def _check_termination(self) -> bool:
         """
         Check if episode should terminate (collision, off-track, etc.).
-
-        For now this checks if the robot has flipped or fallen below
-        the ground plane, which indicates a physics failure.
         """
         position = self._get_robot_position()
+        spawn_z = self.config.spawn_z
 
         # Fell through the ground
-        if position[2] < -0.5:
-            logger.debug("Termination: robot fell below ground")
+        if position[2] < (spawn_z - 2.0):
+            print(f"[IsaacDirectEnv] Termination: robot fell! Z={position[2]:.2f}")
             return True
 
-        # Flipped over (Z position too high for a ground vehicle)
-        if position[2] > 0.5:
-            logger.debug("Termination: robot flipped")
+        # Flipped over or flew away
+        if position[2] > (spawn_z + 2.0):
+            print(f"[IsaacDirectEnv] Termination: robot flipped/launched! Z={position[2]:.2f}")
             return True
 
         return False
