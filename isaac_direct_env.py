@@ -140,6 +140,13 @@ class IsaacDirectEnv(gym.Env):
                 if self._simulation_app: self._simulation_app.update()
 
         self._world.get_physics_context().set_gravity(-9.81)
+
+        # Phase 2.4 Fix: Restore native robot scale lost during USD reference import
+        from omni.isaac.core.utils.prims import set_prim_property
+        from pxr import Gf
+        if is_prim_path_valid(self.config.robot_prim_path):
+            set_prim_property(self.config.robot_prim_path, "xformOp:scale", Gf.Vec3d(0.0078125, 0.01, 0.009615))
+
         self._robot_articulation = Articulation(self.config.robot_prim_path)
         self._world.scene.add(self._robot_articulation)
         self._setup_camera()
