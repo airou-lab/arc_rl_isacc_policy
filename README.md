@@ -24,7 +24,7 @@ A critical "no-gradient" bug was resolved by recreating the optimizer in `__init
 # Recreate optimizer AFTER all hierarchical heads are built.
 self.optimizer = self.optimizer_class(
     self.parameters(),
-    lr=self.lr_schedule(1),
+    lr=lr_schedule(1),
     **self.optimizer_kwargs,
 )
 ```

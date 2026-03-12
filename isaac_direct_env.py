@@ -17,7 +17,7 @@ class IsaacDirectConfig:
     Configuration for the direct-API Isaac Sim environment.
     """
     # === Scene ===
-    usd_path: str = "/home/arika/Documents/arcpro/arcpro_system/src/examples/ARCPro_RL/arc_rl_isacc_sim/openStreetUSD/no_graph_sim.usd"
+    usd_path: str = "/home/arika/Documents/arcpro/arcpro_system/src/examples/ARCPro_RL/arc_rl_isacc_sim/openStreetUSD/arcpro_RL_open_street_sim.usd"
     robot_prim_path: str = "/World/F1Tenth"
     camera_prim_path: str = "/World/F1Tenth/Rigid_Bodies/Chassis/Camera_Left"
 
@@ -31,8 +31,8 @@ class IsaacDirectConfig:
     img_height: int = 90
 
     # === Vehicle geometry ===
-    wheelbase: float = 0.33
-    track_width: float = 0.28
+    wheelbase: float = 0.25
+    track_width: float = 0.24
     wheel_radius: float = 0.05
 
     steering_joints: Tuple[str, ...] = ("Knuckle__Upright__Front_Left", "Knuckle__Upright__Front_Right")
@@ -141,11 +141,11 @@ class IsaacDirectEnv(gym.Env):
 
         self._world.get_physics_context().set_gravity(-9.81)
 
-        # Phase 2.4 Fix: Restore native robot scale lost during USD reference import
-        from omni.isaac.core.utils.prims import set_prim_property
-        from pxr import Gf
-        if is_prim_path_valid(self.config.robot_prim_path):
-            set_prim_property(self.config.robot_prim_path, "xformOp:scale", Gf.Vec3d(0.0078125, 0.01, 0.009615))
+        # DISABLED runtime scaling - using baked metric USD assets
+        # from omni.isaac.core.utils.prims import set_prim_property
+        # from pxr import Gf
+        # if is_prim_path_valid(self.config.robot_prim_path):
+        #    set_prim_property(self.config.robot_prim_path, "xformOp:scale", Gf.Vec3d(0.0078125, 0.01, 0.009615))
 
         self._robot_articulation = Articulation(self.config.robot_prim_path)
         self._world.scene.add(self._robot_articulation)
@@ -186,7 +186,13 @@ class IsaacDirectEnv(gym.Env):
         self._last_position = current_pos
         self._step_count += 1
         obs = self._get_obs()
-        return obs, self._compute_reward(obs), False, (self._step_count >= self.config.max_episode_steps), {"episode_step": self._step_count}
+        
+        # Termination conditions
+        terminated = False
+        if current_pos[2] < -1.0 or current_pos[2] > 10.0: terminated = True # Fell off or exploded
+        if np.isnan(current_pos).any(): terminated = True
+        
+        return obs, self._compute_reward(obs), terminated, (self._step_count >= self.config.max_episode_steps), {"episode_step": self._step_count}
 
     def _get_obs(self):
         return {"image": self._capture_camera(), "vec": self._compute_telemetry()}
@@ -222,7 +228,8 @@ class IsaacDirectEnv(gym.Env):
         lat_err = telemetry[8]
         yaw_rate = telemetry[4]
         
-        if speed < 0.1: return -1.0 # Force movement
+        # Give a small grace period for startup (first 10 steps)
+        if speed < 0.1 and self._step_count > 10: return -1.0 
 
         if self.config.reward_mode == "hybrid":
             lane_reward = 2.0 * math.exp(-(lat_err**2) / 0.25)
