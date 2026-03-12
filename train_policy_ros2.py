@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-train_policy_ros2.py - Hierarchical PPO Training for Isaam Sim
+train_policy_ros2.py - Hierarchical PPO Training for Isaac Sim
 
 Architecture:
-    IsaacROS2Env (Gymnasium)
+    IsaacDirectEnv (Gymnasium, direct PhysX API)
+        -> AgentEnvWrapper (Worker route planning + go/brake safety gate)
         -> WaypointTrackingWrapper (trajectory recording + safety backfill)
         -> Monitor (episode stats logging)
     -> DummyVecEnv
@@ -19,11 +20,11 @@ Usage:
     # Resume from checkpoint:
     python train_policy_ros2.py --resume models/my_run/checkpoints/hppo_100000_steps.zip
 
-Prerequistes:
-    - Isaam Sim running with ROS2 bridge enabled
-    - Camera publishing to /camera/image_raw
-    - State publishing to /vehicle_state
-    - Ackermann controller listening on /ackermann_cmd
+Prerequisites:
+    - Isaac Sim running (headless or GUI)
+    - USD scene loaded with VehicleTest prefab map
+    - config/intersection_topology.json present (connectivity only)
+    - config/geometry_cache.json auto-generated on first run
 """
 
 import argparse
@@ -42,9 +43,19 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 # Project imports
-from isaac_ros2_env import IsaacROS2Env, IsaacROS2Config
+from isaac_direct_env import IsaacDirectEnv, IsaacDirectConfig
 from policies.hierarchical_policy import HierarchicalPathPlanningPolicy
 from policies.fusion_policy import FusionFeaturesExtractor
+
+# Agent imports — Worker-Driver architecture replaces set_turn_bias()
+from agent import (
+    AgentEnvWrapper,
+    AgentConfig,
+    WorkerConfig,
+    IntersectionGraph,
+    GeometryCalibrator,
+    CalibrationConfig,
+)
 
 # Optional: waypoint tracking for self-supervised auxiliary loss
 try:
@@ -106,16 +117,28 @@ class EpisodeStatsCallback(BaseCallback):
         return True
 
 
-def make_env(config: IsaacROS2Config, use_waypoint_wrapper: bool = True):
+def make_env(
+    env_config: IsaacDirectConfig,
+    graph: IntersectionGraph,
+    agent_config: AgentConfig,
+    use_waypoint_wrapper: bool = True,
+):
     """
     Factory function for creating the training environment.
 
     Pipeline:
-        IsaacROS2Env -> WaypointTrackingWrapper (optional) -> Monitor
+        IsaacDirectEnv -> AgentEnvWrapper -> WaypointTrackingWrapper (optional) -> Monitor
+
+    The AgentEnvWrapper replaces set_turn_bias() by running the Worker node every step:
+    it queries the intersection graph, picks a turn, injects turn_token and go_signal
+    into vec[0:2], and gates actions with the go/brake safety override.
     """
 
     def _init():
-        env = IsaacROS2Env(config=config)
+        env = IsaacDirectEnv(config=env_config)
+
+        # Agent wrapper: Worker + Main nodes for graph-based navigation
+        env = AgentEnvWrapper(env, graph=graph, agent_config=agent_config)
 
         # Wrap with trajectory tracking for waypoint auxiliary loss
         if use_waypoint_wrapper and HAS_WAYPOINT_WRAPPER:
@@ -148,16 +171,22 @@ def main():
 
     # Environment
     parser.add_argument(
-        "--camera-topic", type=str, default="/camera/image_raw"
-    )
-    parser.add_argument(
-        "--state-topic", type=str, default="/vehicle_state"
-    )
-    parser.add_argument(
-        "--control-topic", type=str, default="/ackermann_cmd"
-    )
-    parser.add_argument(
         "--episode-timeout", type=float, default=30.0, help="Episode timeout (seconds)"
+    )
+
+    # Agent / Worker
+    parser.add_argument(
+        "--topology", type=str, default="config/intersection_topology.json",
+        help="Path to intersection topology JSON"
+    )
+    parser.add_argument(
+        "--geometry-cache", type=str, default="config/geometry_cache.json",
+        help="Path to geometry cache (auto-generated on first run)"
+    )
+    parser.add_argument(
+        "--worker-mode", type=str, default="curriculum",
+        choices=["route", "random", "curriculum"],
+        help="Worker turn selection mode"
     )
 
     # PPO hyperparameters
@@ -175,7 +204,7 @@ def main():
     # Policy architecture
     parser.add_argument("--lstm-size", type=int, default=256, help="LSTM hidden size")
     parser.add_argument("--num-waypoints", type=int, default=5, help="Number of waypoints to predict")
-    parser.add_argument("-waypoint-horizon", type=float, default=2.5, help="Planning horizon (meters)")
+    parser.add_argument("--waypoint-horizon", type=float, default=2.5, help="Planning horizon (meters)")
     parser.add_argument("--no-kinematic-anchors", action="store_true", help="Disable kinematic anchors (ablation)")
 
     # Device
@@ -198,17 +227,38 @@ def main():
     print(f"  TensorBoard: tensorboard --logdir {tb_dir}")
     print(f"  Timesteps: {args.timesteps:,}")
 
-    # Environment
-    env_config = IsaacROS2Config(
+    # ── Intersection Graph ────────────────────────────────────────
+    # Load topology (connectivity only, no positions/lengths)
+    graph = IntersectionGraph.from_json(args.topology)
+    print(f"  Topology: {graph}")
+
+    # Auto-calibrate geometry (positions + edge lengths from PhysX)
+    calibrator = GeometryCalibrator(
+        graph,
+        CalibrationConfig(cache_path=args.geometry_cache),
+    )
+    if calibrator.try_load_cache():
+        print(f"  Geometry: loaded from {args.geometry_cache}")
+    else:
+        print(f"  Geometry: no cache found — will calibrate incrementally during training")
+
+    # ── Agent Configuration ───────────────────────────────────────
+    agent_config = AgentConfig(
+        agent_id="agent_0",
+        worker=WorkerConfig(mode=args.worker_mode),
+    )
+    print(f"  Worker mode: {args.worker_mode}")
+
+    # ── Environment ───────────────────────────────────────────────
+    env_config = IsaacDirectConfig(
         img_width=160,
         img_height=90,
-        camera_topic=args.camera_topic,
-        state_topic=args.state_topic,
-        control_topic=args.control_topic,
         episode_timeout=args.episode_timeout,
     )
 
-    vec_env = DummyVecEnv([make_env(env_config, use_waypoint_wrapper=True)])
+    vec_env = DummyVecEnv([
+        make_env(env_config, graph, agent_config, use_waypoint_wrapper=True)
+    ])
 
     # Model
     if args.resume:
@@ -227,7 +277,7 @@ def main():
             n_lstm_layers=1,
             enable_critic_lstm=True,
             share_features_extractor=True,
-            # Hierarchical planning paramaters
+            # Hierarchical planning parameters
             num_waypoints=args.num_waypoints,
             waypoint_horizon=args.waypoint_horizon,
             use_kinematic_anchors=not args.no_kinematic_anchors,

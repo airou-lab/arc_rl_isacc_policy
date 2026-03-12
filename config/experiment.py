@@ -5,10 +5,10 @@ Experiment Configuration Dataclasses
 Hierarchical config tree:
 
     ExperimentConfig
-    ├── SimConfig          — simulator selection, camera res, physics dt
-    ├── TrainingConfig     — PPO hyperparameters, timesteps, scheduling
-    ├── PolicyConfig       — architecture choices (LSTM/Mamba, action head)
-    └── BaselineConfig     — behavioral cloning settings (DAVE-2, etc.)
+    |-- SimConfig          — simulator selection, camera res, physics dt
+    |-- TrainingConfig     — PPO hyperparameters, timesteps, scheduling
+    |-- PolicyConfig       — architecture choices (LSTM/Mamba, action head)
+    |-- BaselineConfig     — behavioral cloning settings (DAVE-2, etc.)
 
 Each dataclass:
     - Has sensible defaults matching our standard ARCPro configuration
@@ -33,35 +33,27 @@ from pathlib import Path
 import yaml
 import json
 
-
-# ═══════════════════════════════════════════════════════════════════
-#  TELEMETRY VECTOR PROTOCOL
-#  Canonical definition of the 12-float observation vector.
-#  Both environments and policies index into this vector.
-#  Changing these indices requires updating BOTH sides.
-# ═══════════════════════════════════════════════════════════════════
+#  Telemetry Vectors
 
 TELEMETRY_INDICES = {
-    "turn_bias": 0,       # Continuous turn command [-1, 1]
-    "reserved": 1,        # Reserved (always 0)
-    "goal_dist": 2,       # Goal distance (masked to 0 during PVP training)
-    "speed": 3,           # Vehicle speed (m/s)
-    "yaw_rate": 4,        # Yaw rate (rad/s)
-    "last_steer": 5,      # Previous steering command
-    "last_throttle": 6,   # Previous throttle command
-    "last_brake": 7,      # Previous brake command
-    "lateral_error": 8,   # Lateral error from path (m)
-    "heading_error": 9,   # Heading error from path (rad)
-    "curvature": 10,      # Path curvature (1/m)
+    "turn_token": 0,          # Discrete turn command {-1, 0, 1} from Worker
+    "go_signal": 1,           # Go/wait {0.0, 1.0} from Scheduler
+    "goal_dist": 2,           # Goal distance (masked to 0 during PVP training)
+    "speed": 3,               # Vehicle speed (m/s)
+    "yaw_rate": 4,            # Yaw rate (rad/s)
+    "last_steer": 5,          # Previous steering command
+    "last_throttle": 6,       # Previous throttle command
+    "last_brake": 7,          # Previous brake command
+    "lateral_error": 8,       # Lateral error from path (m)
+    "heading_error": 9,       # Heading error from path (rad)
+    "curvature": 10,          # Path curvature (1/m)
     "distance_traveled": 11,  # Cumulative odometry
 }
 
 TELEMETRY_DIM = 12  # Length of the vec observation
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  SIMULATOR CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════
+# Simulator Configuration
 
 @dataclass
 class SimConfig:
@@ -86,8 +78,8 @@ class SimConfig:
     camera_height: int = 90
 
     # Physics
-    physics_dt: float = 1.0 / 60.0       # 60 Hz physics
-    render_dt: float = 1.0 / 30.0        # 30 Hz rendering
+    physics_dt: float = 1.0 / 60.0        # 60 Hz physics
+    render_dt: float = 1.0 / 30.0         # 30 Hz rendering
     control_hz: int = 10                  # Policy inference rate
 
     # Vehicle
@@ -107,9 +99,7 @@ class SimConfig:
     control_topic: str = "/ackermann_cmd"
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  TRAINING CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════
+# Training Configuration
 
 @dataclass
 class TrainingConfig:
@@ -153,9 +143,7 @@ class TrainingConfig:
     device: str = "auto"                  # "auto" | "cpu" | "cuda"
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  POLICY CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════
+# Policy Configuration
 
 @dataclass
 class PolicyConfig:
@@ -204,9 +192,7 @@ class PolicyConfig:
     net_arch_vf: List[int] = field(default_factory=lambda: [64])
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  BASELINE CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════
+# Baseline Configuration
 
 @dataclass
 class BaselineConfig:
@@ -247,9 +233,7 @@ class BaselineConfig:
     predict_brake: bool = False          # True: predict [steer, throttle, brake]
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  ROOT EXPERIMENT CONFIGURATION
-# ═══════════════════════════════════════════════════════════════════
+# Root Experiment Configuration 
 
 @dataclass
 class ExperimentConfig:

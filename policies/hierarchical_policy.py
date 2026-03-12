@@ -22,8 +22,9 @@ Architecture:
     inductive bias towards smooth curved paths while allowing learned corrections.
 
 Kinematic Anchors:
-    Dynamic curved paths computed from turn_bias (navigation command) blended with current steering for smooth transitions.
-    Supports continuous turn_bias in [-1, 1] instead of discrete {-1, 0, 1}.
+    Dynamic curved paths computed from turn_token (discrete navigation command from Worker)
+    blended with current steering for smooth transitions.
+    turn_token values {-1, 0, 1} map to LEFT, STRAIGHT, RIGHT.
 
 Key Design Decisions:
     - Waypoint normalization (/ WAYPOINT_NORM_SCALE) is centralized in _compute_control_features() to prevent the forward/evaluate_actions
@@ -68,20 +69,19 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
     # Normalization constant for waypoints (meters -> normalized space)
     WAYPOINT_NORM_SCALE = 20.0
 
-    # Telemetry vector indices (must match isaac_ros2_env.py protocol)
-    # These are identical and ensure the same 12-float observation vector.
-    IDX_TURN_BIAS = 0 # Continuous turn command [-1, 1]
-    IDX_RESERVED = 1 # Reserved (always 0)
-    IDX_GOAL_DIST = 2 # Goal distance (masked to 0 during training)
-    IDX_SPEED = 3 # Vehicle speed (m/s)
-    IDX_YAW_RATE = 4 # Yaw rate (rad/s)
+    # Telemetry vector indices (must match experiment.py TELEMETRY_INDICES)
+    IDX_TURN_TOKEN = 0 # Discrete turn command {-1, 0, 1} from Worker
+    IDX_GO_SIGNAL = 1  # Go/wait {0.0, 1.0} from Scheduler
+    IDX_GOAL_DIST = 2  # Goal distance (masked to 0 during training)
+    IDX_SPEED = 3      # Vehicle speed (m/s)
+    IDX_YAW_RATE = 4   # Yaw rate (rad/s)
     IDX_LAST_STEER = 5 # Previous steering command
-    IDX_LAST_THR = 6 # Previous throttle command
-    IDX_LAST_BRK = 7 # Previous brake command
-    IDX_LAT_ERR = 8 # Lateral error from path (m)
-    IDX_HDG_ERR = 9 # Heading error from path (rad)
-    IDX_KAPPA = 10 # Path curvature (1/m)
-    IDX_DS = 11 # Distance traveled / cumulative odometry
+    IDX_LAST_THR = 6   # Previous throttle command
+    IDX_LAST_BRK = 7   # Previous brake command
+    IDX_LAT_ERR = 8    # Lateral error from path (m)
+    IDX_HDG_ERR = 9    # Heading error from path (rad)
+    IDX_KAPPA = 10     # Path curvature (1/m)
+    IDX_DS = 11        # Distance traveled / cumulative odometry
 
     def __init__(
         self,
@@ -131,10 +131,10 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
             waypoint_horizon: Total forward distance (meters) spanned by waypoints.
             repulsion_weight: Weight for crash-avoidance auxiliary loss term.
             waypoint_loss_weight: Weight for waypoint auxiliary loss vs PPO loss.
-            use_kinematic_anchors: If True, compute curved anchors from turn_bias + steering.
+            use_kinematic_anchors: If True, compute curved anchors from turn_token + steering.
                                    If False use static straight-line anchors.
             curvature_gain: How aggressively anchors curve (radians per unit curvature signal)
-            command_blend_factor: Weight given to turn_bias vs current steering.
+            command_blend_factor: Weight given to turn_token vs current steering.
             progressive_curvature_exp: Exponent for increasing curvature at distance.
             max_deviation_meters: Maximum learned deviation from anchor path.
         """
@@ -294,7 +294,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         Compute curved anchor points from turn command and current steering.
 
         This creates an inductive bias toward continuing the current maneuver while respecting
-        the high-level navigation intent from turn_bias.
+        the high-level navigation intent from the Worker's turn_token.
 
         Args:
             obs_vec: (batch_size, 12) telemetry vector.
@@ -306,18 +306,18 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         device = obs_vec.device
 
         # Extract relevant signals
-        turn_bias = obs_vec[:, self.IDX_TURN_BIAS] # [-1, 1] navigation command
+        turn_token = obs_vec[:, self.IDX_TURN_TOKEN] # {-1, 0, 1} from Worker
         last_steer = obs_vec[:, self.IDX_LAST_STEER] # [-1, 1] current steering
 
         # Adaptive blending: strong command -> trust navigation intent,
         #                    weak command -> trust current steering for smooth driving
-        command_strength = torch.abs(turn_bias)
+        command_strength = torch.abs(turn_token)
         adaptive_command_weight = self.command_blend_factor + 0.3 * command_strength
         adaptive_steer_weight = 1.0 - adaptive_command_weight
 
         # Compute effective curvature signal
         effective_curvature = (
-            adaptive_command_weight * turn_bias
+            adaptive_command_weight * turn_token
             + adaptive_steer_weight * last_steer
         )
         effective_curvature = torch.clamp(effective_curvature, -1.0, 1.0)
