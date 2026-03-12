@@ -1,0 +1,47 @@
+{
+  "_comment": [
+    "TOPOLOGY ONLY — no positions or lengths.",
+    "Connectivity is stable; geometry is auto-calibrated from PhysX.",
+    "Roads A/B/C/D radiate from a single intersection.",
+    "Headings are approximate approach directions (degrees).",
+    "0=+X, 90=+Y, counter-clockwise in Isaac Sim world frame."
+  ],
+  "intersections": {
+    "int_main": {
+      "approaches": {
+        "road_A": {
+          "heading": 270,
+          "exits": {
+            "left":     { "road": "road_D" },
+            "straight": { "road": "road_C" },
+            "right":    { "road": "road_B" }
+          }
+        },
+        "road_B": {
+          "heading": 180,
+          "exits": {
+            "left":     { "road": "road_A" },
+            "straight": { "road": "road_D" },
+            "right":    { "road": "road_C" }
+          }
+        },
+        "road_C": {
+          "heading": 90,
+          "exits": {
+            "left":     { "road": "road_B" },
+            "straight": { "road": "road_A" },
+            "right":    { "road": "road_D" }
+          }
+        },
+        "road_D": {
+          "heading": 0,
+          "exits": {
+            "left":     { "road": "road_C" },
+            "straight": { "road": "road_B" },
+            "right":    { "road": "road_A" }
+          }
+        }
+      }
+    }
+  }
+}
