@@ -1,10 +1,6 @@
 # ARCPro RL Reward Architectures
 
-This document explains the two reward strategies implemented in `IsaacDirectEnv` for training the F1Tenth policy.
-
-## File Location
-The reward logic is located in:
-`src/examples/ARCPro_RL/arc_rl_isacc_policy/isaac_direct_env.py`
+This document explains the two reward strategies developed for the ARCPro system, which are being ported to the **Isaac Lab Reward Manager**.
 
 ---
 
@@ -50,15 +46,4 @@ Instead of a simple "In/Out" bonus, the Hybrid Racer uses a bell curve.
 - **Slightly Off-center:** +1.5 reward.
 - **Near the Edge:** +0.2 reward.
 
-This provides a continuous gradient that "pulls" the AI toward the center of the lane, leading to much smoother racing lines and higher stability at high speeds.
-
----
-
-## How to Switch Modes
-Modify the `IsaacDirectConfig` in `isaac_direct_env.py`:
-
-```python
-@dataclass
-class IsaacDirectConfig:
-    reward_mode: str = "hybrid" # Options: "original" or "hybrid"
-```
+This providing a continuous gradient that "pulls" the AI toward the center of the lane, leading to much smoother racing lines and higher stability at high speeds.
