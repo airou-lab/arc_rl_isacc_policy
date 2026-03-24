@@ -1,6 +1,5 @@
 """
 Experiment Configuration Dataclasses
-=====================================
 
 Hierarchical config tree:
 
@@ -25,6 +24,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/02/26
+Updated: 03/23/26 — Gazebo Harmonic branch (SimConfig)
 """
 
 from dataclasses import dataclass, field, asdict
@@ -33,7 +33,7 @@ from pathlib import Path
 import yaml
 import json
 
-#  Telemetry Vectors
+# Telemetry Vectors
 
 TELEMETRY_INDICES = {
     "turn_token": 0,          # Discrete turn command {-1, 0, 1} from Worker
@@ -67,10 +67,16 @@ class SimConfig:
     Camera resolution is fixed at 160x90 (16:9) to match the D435i
     downsampled output. Changing this requires recomputing CNN dimensions
     in FusionFeaturesExtractor.
+
+    Gazebo branch changes (vs Isaac):
+        - sim_type default: "gazebo"
+        - Vehicle geometry from f1tenth.xacro ground truth
+        - Physics: 1000 Hz (Gazebo default) vs 60 Hz (Isaac)
+        - Added: world_name, model_name, gz-transport topic fields
     """
 
     # Simulator selection (used by future registry/factory)
-    sim_type: str = "isaac"  # "isaac" | "carla" | "unity"
+    sim_type: str = "gazebo"  # "gazebo" | "isaac" | "carla" | "unity"
 
     # Rendering
     headless: bool = True
@@ -78,11 +84,15 @@ class SimConfig:
     camera_height: int = 90
 
     # Physics
-    physics_dt: float = 1.0 / 60.0        # 60 Hz physics
-    render_dt: float = 1.0 / 30.0         # 30 Hz rendering
+    # Gazebo Harmonic default: 1000 Hz physics (DART engine)
+    # Isaac used 60 Hz x 6 substeps; Gazebo uses 1000 Hz x 100 substeps
+    # Both yield 10 Hz control rate (control_hz).
+    physics_dt: float = 0.001             # 1000 Hz (Gazebo default)
+    render_dt: float = 1.0 / 30.0         # 30 Hz rendering / camera sensor
     control_hz: int = 10                  # Policy inference rate
 
-    # Vehicle
+    # Vehicle (XACRO ground truth from f1tenth_description)
+    # XACRO has: wheelbase=0.3302, track_width=0.2413, wheel_radius=0.0508
     max_steering_angle: float = 0.5       # radians (~28.6 degrees)
     max_acceleration: float = 3.0         # m/s^2
 
@@ -93,7 +103,19 @@ class SimConfig:
     # Parallelization (for future vectorized envs)
     num_parallel_envs: int = 1
 
-    # ROS2 topics (only used by isaac_ros2_env.py, not direct API envs)
+    # Gazebo-specific fields
+    # These are only used by GazeboDirectEnv. Isaac fields are kept
+    # below for backward compatibility if running from a shared config.
+
+    world_name: str = "arcpro_world"      # Gazebo world name
+    model_name: str = "f1tenth"           # Model name in SDF
+
+    # gz-transport topics (must match SDF sensor/plugin config)
+    gz_camera_topic: str = "/camera"
+    gz_cmd_vel_topic: str = "/cmd_vel"
+    gz_imu_topic: str = "/imu"
+
+    # ROS2 topics (deployment only, not used in training)
     camera_topic: str = "/camera/image_raw"
     state_topic: str = "/vehicle_state"
     control_topic: str = "/ackermann_cmd"
@@ -106,7 +128,7 @@ class TrainingConfig:
     """
     Training hyperparameters for PPO-based reinforcement learning.
 
-    These match the argparse defaults in train_policy_ros2.py but are
+    These match the argparse defaults in train_policy.py but are
     now typed and serializable. The reward_strategy field selects which
     reward function is used (for future strategy pattern).
     """
@@ -154,7 +176,7 @@ class PolicyConfig:
     temporal backbone, planning head, and control head.
 
     The temporal_backbone and action_head fields are forward-compatible
-    placeholders for Phase 3 (Mamba, flow matching).
+    placeholders for (Mamba, flow matching).
     """
 
     # Feature extraction
@@ -206,7 +228,7 @@ class BaselineConfig:
     """
 
     # Model selection
-    model_type: str = "dave2"             # "dave2" | "resnet_bc" (future)
+    model_type: str = "dave2"            # "dave2"
 
     # DAVE-2 specific
     input_height: int = 66               # DAVE-2 canonical crop height
@@ -233,7 +255,7 @@ class BaselineConfig:
     predict_brake: bool = False          # True: predict [steer, throttle, brake]
 
 
-# Root Experiment Configuration 
+# Root Experiment Configuration
 
 @dataclass
 class ExperimentConfig:

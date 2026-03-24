@@ -1,6 +1,5 @@
 """
 Agent Environment Wrapper
-=========================
 
 Gymnasium wrapper that integrates AgentNode (Worker + Main) into any
 environment that uses the 12-float telemetry vector protocol.
@@ -27,7 +26,7 @@ Integration:
     env.set_turn_bias(0.0)  # or random
 
     # New way (graph-based):
-    env = IsaacDirectEnv(config)
+    env = IsaacDirectEnv(config)  # or GazeboDirectEnv(config)
     graph = IntersectionGraph.from_json("config/intersection_graph.json")
     env = AgentEnvWrapper(env, graph=graph, agent_config=AgentConfig())
 
@@ -37,18 +36,22 @@ Integration:
 
 Position Source:
     The wrapper needs the agent's world-frame position and heading every
-    step so the Worker can query the intersection graph. There are two
-    modes:
+    step so the Worker can query the intersection graph. There are three
+    modes, tried in order:
 
-    1. Direct API (IsaacDirectEnv): position comes from PhysX via
-       env._get_robot_position() and env._get_robot_yaw_rate().
-       This is ground truth — fine for training.
+    1. _get_robot_heading() method (GazeboDirectEnv): heading comes from
+       the PosePublisher subscriber. This is ground truth.
 
-    2. ROS2 deployment (IsaacROS2Env): position comes from EKF
-       (robot_localization). Not yet wired — need to provide
-       the /odometry/filtered topic. For now, the wrapper falls back
-       to dead-reckoning from speed + yaw_rate, which is sufficient
-       for the intersection trigger radius check.
+    2. _robot_articulation quaternion (IsaacDirectEnv): heading is
+       extracted from the PhysX articulation's world pose quaternion.
+       This is ground truth.
+
+    3. Dead-reckoning fallback (any env): heading is integrated from
+       speed + yaw_rate. Sufficient for the intersection trigger
+       radius check but drifts over time.
+
+    Both (1) and (2) use _get_robot_position() for (x, y) — this
+    method is provided by both IsaacDirectEnv and GazeboDirectEnv.
 
 Dependencies:
     - agent/agent_node.py (AgentNode, AgentConfig)
@@ -59,6 +62,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/12/26
+Updated: 03/23/26 — Simulator-agnostic heading extraction
 """
 
 from __future__ import annotations
@@ -101,7 +105,7 @@ class AgentEnvWrapper(gym.Wrapper):
     ):
         """
         Args:
-            env: Inner environment (IsaacDirectEnv or IsaacROS2Env).
+            env: Inner environment (IsaacDirectEnv or GazeboDirectEnv).
             graph: Intersection graph for route planning.
             agent_config: Configuration for the Agent's Worker and Main.
             scheduler: Optional multi-agent scheduler. If None, single-agent
@@ -120,7 +124,7 @@ class AgentEnvWrapper(gym.Wrapper):
             scheduler=scheduler,
         )
 
-        # Dead-reckoning state (fallback when no PhysX position)
+        # Dead-reckoning state (fallback when no ground-truth position)
         self._dr_x: float = 0.0
         self._dr_y: float = 0.0
         self._dr_heading: float = 0.0
@@ -163,7 +167,7 @@ class AgentEnvWrapper(gym.Wrapper):
         1. Gate action with go/brake override (from last step's go_signal)
         2. Send gated action to inner env
         3. Get new observation
-        4. Extract position from env (PhysX) or dead-reckoning
+        4. Extract position from env (ground truth) or dead-reckoning
         5. Run Worker on new position -> new turn_token + go_signal
         6. Inject into observation for next policy forward pass
         """
@@ -173,7 +177,7 @@ class AgentEnvWrapper(gym.Wrapper):
         # 2. Step the inner environment
         obs, reward, terminated, truncated, info = self.env.step(gated_action)
 
-        # 3. Scheduler housekeeping
+        # 3. Scheduler check
         if self.scheduler is not None:
             self.scheduler.tick()
 
@@ -204,8 +208,22 @@ class AgentEnvWrapper(gym.Wrapper):
         """
         Extract agent position, heading, speed from environment.
 
-        Tries PhysX ground truth first (IsaacDirectEnv), falls back
-        to dead-reckoning from telemetry (IsaacROS2Env).
+        Three extraction paths, tried in order:
+
+        1. _get_robot_heading() method (GazeboDirectEnv):
+           Position from _get_robot_position(), heading from
+           _get_robot_heading(). Both are ground truth from
+           gz-transport subscribers.
+
+        2. _robot_articulation quaternion (IsaacDirectEnv):
+           Position from _get_robot_position(), heading from
+           the articulation's world pose quaternion. Both are
+           PhysX ground truth.
+
+        3. Dead-reckoning fallback (any env):
+           Integrates speed + yaw_rate from the telemetry vector.
+           Drifts over time but sufficient for intersection
+           trigger radius checks.
 
         Returns:
             ((x, y), heading_rad, speed_mps)
@@ -213,29 +231,42 @@ class AgentEnvWrapper(gym.Wrapper):
         speed = float(obs["vec"][IDX_SPEED])
         yaw_rate = float(obs["vec"][IDX_YAW_RATE])
 
-        # Try ground truth from IsaacDirectEnv
-        inner = self.env
         # Unwrap through any other wrappers (Monitor, WaypointTracking)
+        # to find the actual simulator environment
+        inner = self.env
         while hasattr(inner, 'env'):
             if hasattr(inner, '_get_robot_position'):
                 break
             inner = inner.env
 
-        if hasattr(inner, '_get_robot_position') and hasattr(inner, '_robot_articulation'):
+        if hasattr(inner, '_get_robot_position'):
             try:
                 pos_3d = inner._get_robot_position()
                 x, y = float(pos_3d[0]), float(pos_3d[1])
 
-                # Get heading from angular velocity integration
-                # or from the articulation's orientation
-                if hasattr(inner, '_robot_articulation') and inner._robot_articulation is not None:
+                # Path 1: explicit heading method (GazeboDirectEnv)
+                if hasattr(inner, '_get_robot_heading'):
+                    heading = float(inner._get_robot_heading())
+
+                # Path 2: articulation quaternion (IsaacDirectEnv)
+                elif (
+                    hasattr(inner, '_robot_articulation')
+                    and inner._robot_articulation is not None
+                ):
                     try:
                         quat = inner._robot_articulation.get_world_pose()[1]
-                        # Quaternion to yaw: atan2(2(wz+xy), 1-2(yy+zz))
-                        w, qx, qy, qz = float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
-                        heading = math.atan2(2 * (w * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
+                        w = float(quat[0])
+                        qx = float(quat[1])
+                        qy = float(quat[2])
+                        qz = float(quat[3])
+                        heading = math.atan2(
+                            2 * (w * qz + qx * qy),
+                            1 - 2 * (qy * qy + qz * qz),
+                        )
                     except Exception:
                         heading = self._dr_heading
+
+                # Path 3: no heading source, use dead-reckoning
                 else:
                     heading = self._dr_heading
 
@@ -249,7 +280,7 @@ class AgentEnvWrapper(gym.Wrapper):
             except Exception:
                 pass  # Fall through to dead-reckoning
 
-        # Dead-reckoning fallback (IsaacROS2Env or error)
+        # Pure dead-reckoning fallback
         self._dr_heading += yaw_rate * self.control_dt
         self._dr_x += speed * math.cos(self._dr_heading) * self.control_dt
         self._dr_y += speed * math.sin(self._dr_heading) * self.control_dt
