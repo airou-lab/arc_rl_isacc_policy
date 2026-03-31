@@ -1,4 +1,3 @@
-
 import math
 import time
 import logging
@@ -9,6 +8,8 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+from envs.registry import register_sim
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -16,21 +17,21 @@ class IsaacDirectConfig:
     """
     Configuration for the direct-API Isaac Sim environment.
     """
-    # === Scene ===
+    # Scene
     usd_path: str = "/home/arika/Documents/arcpro/arcpro_system/src/examples/ARCPro_RL/arc_rl_isacc_sim/openStreetUSD/no_graph_sim.usd"
     robot_prim_path: str = "/World/F1Tenth"
     camera_prim_path: str = "/World/F1Tenth/Rigid_Bodies/Chassis/Camera_Left"
 
-    # === Reward Strategy ===
+    # Reward Strategy
     # "original": Linear lane bonus + Boosted Speed (default)
     # "hybrid": Gaussian lane precision + Momentum weighting
-    reward_mode: str = "original" 
+    reward_mode: str = "original"
 
-    # === Camera ===
+    # Camera
     img_width: int = 160
     img_height: int = 90
 
-    # === Vehicle geometry ===
+    # Vehicle geometry
     wheelbase: float = 0.33
     track_width: float = 0.28
     wheel_radius: float = 0.05
@@ -38,21 +39,21 @@ class IsaacDirectConfig:
     steering_joints: Tuple[str, ...] = ("Knuckle__Upright__Front_Left", "Knuckle__Upright__Front_Right")
     drive_joints: Tuple[str, ...] = ("Wheel__Knuckle__Front_Left", "Wheel__Knuckle__Front_Right", "Wheel__Upright__Rear_Left", "Wheel__Upright__Rear_Right")
 
-    # === Control limits ===
+    # Control limits
     max_steering_angle: float = 0.5
     max_speed: float = 3.0
 
-    # === Physics ===
+    # Physics
     physics_dt: float = 1.0 / 60.0
     render_dt: float = 1.0 / 30.0
     control_hz: int = 10
     substeps: int = 6
 
-    # === Episode ===
+    # Episode
     episode_timeout: float = 30.0
     max_episode_steps: int = 300
 
-    # === Reset ===
+    # Reset
     spawn_x: float = -125.0
     spawn_y: float = 62.0
     spawn_z: float = 0.5
@@ -81,6 +82,7 @@ class AckermannComputer:
         wheel_velocities = np.array([outer_omega, inner_omega, outer_omega, inner_omega], dtype=np.float32) if steering_angle > 0 else np.array([inner_omega, outer_omega, inner_omega, outer_omega], dtype=np.float32)
         return wheel_angles, wheel_velocities
 
+@register_sim("isaac")
 class IsaacDirectEnv(gym.Env):
     def __init__(self, config: Optional[IsaacDirectConfig] = None, simulation_app=None):
         super().__init__()
@@ -122,7 +124,7 @@ class IsaacDirectEnv(gym.Env):
             for _ in range(100):
                 if self._simulation_app: self._simulation_app.update()
         self._world = World(physics_dt=self.config.physics_dt, rendering_dt=self.config.render_dt, stage_units_in_meters=1.0)
-        
+
         # Ground plane contrast fix
         if is_prim_path_valid("/World/whiteGround"):
             stage = omni.usd.get_context().get_stage()
@@ -197,7 +199,7 @@ class IsaacDirectEnv(gym.Env):
         vec[3] = float(np.linalg.norm(velocity[:2]))
         vec[4] = float(self._get_robot_yaw_rate())
         vec[5], vec[6], vec[7] = self._last_action
-        
+
         # Internal Lane Detection for Reward Logic
         if self._lane_detector:
             try:
@@ -214,7 +216,7 @@ class IsaacDirectEnv(gym.Env):
         speed = telemetry[3]
         lat_err = telemetry[8]
         yaw_rate = telemetry[4]
-        
+
         if speed < 0.1: return -1.0 # Force movement
 
         if self.config.reward_mode == "hybrid":
