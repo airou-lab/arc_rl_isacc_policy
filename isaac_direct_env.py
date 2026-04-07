@@ -104,6 +104,8 @@ class IsaacDirectEnv(gym.Env):
         self._annotator = None
         self._sim_initialized = False
         self._lane_detector = None
+        self._stuck_timer = 0.0
+        self._offroad_timer = 0.0
 
     def _setup_sim(self):
         if self._sim_initialized: return
@@ -161,6 +163,8 @@ class IsaacDirectEnv(gym.Env):
         self._setup_sim()
         self._step_count = 0
         self._cumulative_distance = 0.0
+        self._stuck_timer = 0.0
+        self._offroad_timer = 0.0
         self._reset_robot_pose()
         self._world.step(render=True)
         self._last_position = self._get_robot_position()
@@ -181,7 +185,41 @@ class IsaacDirectEnv(gym.Env):
         self._last_position = current_pos
         self._step_count += 1
         obs = self._get_obs()
-        return obs, self._compute_reward(obs), False, (self._step_count >= self.config.max_episode_steps), {"episode_step": self._step_count}
+        # Termination
+        terminated = False
+        truncated = self._step_count >= self.config.max_episode_steps
+        info = {"episode_step": self._step_count}
+
+        # Sim-time per step: substeps * physics_dt + render_dt
+        step_dt = self.config.substeps * self.config.physics_dt + self.config.render_dt
+
+        # Stuck: speed < 0.1 m/s for > 5 seconds
+        speed_now = obs["vec"][3]
+        if speed_now < 0.1:
+            self._stuck_timer += step_dt
+        else:
+            self._stuck_timer = 0.0
+        if self._stuck_timer > 5.0:
+            terminated = True
+            info["termination_reason"] = "stuck"
+
+        # Off-road: lane confidence near zero for > 1 second
+        lane_conf = obs["vec"][9]
+        if lane_conf < 0.05:
+            self._offroad_timer += step_dt
+        else:
+            self._offroad_timer = 0.0
+        if self._offroad_timer > 1.0:
+            terminated = True
+            info["termination_reason"] = "off_road"
+
+        # Fall: car fell through ground or flipped
+        if current_pos[2] < -1.0 or current_pos[2] > 5.0:
+            terminated = True
+            info["termination_reason"] = "fell"
+
+        reward = self._compute_reward(obs)
+        return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
         return {"image": self._capture_camera(), "vec": self._compute_telemetry()}
@@ -246,7 +284,7 @@ class IsaacDirectEnv(gym.Env):
         self._robot_articulation.set_linear_velocity(np.zeros(3))
         self._robot_articulation.set_angular_velocity(np.zeros(3))
         self._robot_articulation.set_joint_velocities(np.zeros(self._robot_articulation.num_dof))
-        for _ in range(200): self._world.step(render=False)
+        for _ in range(20): self._world.step(render=False)
 
     def _get_robot_position(self): return np.array(self._robot_articulation.get_world_pose()[0], dtype=np.float64)
     def _get_robot_velocity(self): return np.array(self._robot_articulation.get_linear_velocity(), dtype=np.float64)
