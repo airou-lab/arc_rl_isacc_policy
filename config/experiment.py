@@ -1,6 +1,5 @@
 """
 Experiment Configuration Dataclasses
-=====================================
 
 Hierarchical config tree:
 
@@ -24,7 +23,7 @@ Dependencies:
     - Python 3.10+ (for dataclass features)
 
 Author: Aaron Hamil
-Date: 03/02/26
+Date: 03/31/26
 """
 
 from dataclasses import dataclass, field, asdict
@@ -33,7 +32,7 @@ from pathlib import Path
 import yaml
 import json
 
-#  Telemetry Vectors
+# Telemetry Vectors
 
 TELEMETRY_INDICES = {
     "turn_token": 0,          # Discrete turn command {-1, 0, 1} from Worker
@@ -70,7 +69,7 @@ class SimConfig:
     """
 
     # Simulator selection (used by future registry/factory)
-    sim_type: str = "isaac"  # "isaac" | "carla" | "unity"
+    sim_type: str = "isaac"  # "isaac" | "gazebo" | "carla" (via envs.registry)
 
     # Rendering
     headless: bool = True
@@ -233,7 +232,7 @@ class BaselineConfig:
     predict_brake: bool = False          # True: predict [steer, throttle, brake]
 
 
-# Root Experiment Configuration 
+# Root Experiment Configuration
 
 @dataclass
 class ExperimentConfig:
