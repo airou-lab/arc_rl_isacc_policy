@@ -80,16 +80,16 @@ logger = logging.getLogger(__name__)
 # Telemetry Indices (matches experiment.py)
 
 IDX_TURN_TOKEN = 0     # Discrete turn command from Worker
-IDX_GO_SIGNAL = 1      # Go/wait from Scheduler (was: reserved)
-IDX_GOAL_DIST = 2      # Masked (PVP)
+IDX_GO_SIGNAL = 1      # Go/wait from Scheduler
+IDX_GOAL_DIST = 2      # Zero-padded (PVP)
 IDX_SPEED = 3
 IDX_YAW_RATE = 4
 IDX_LAST_STEER = 5
 IDX_LAST_THROTTLE = 6
 IDX_LAST_BRAKE = 7
-IDX_LAT_ERR = 8        # Masked (PVP)
-IDX_HDG_ERR = 9        # Masked (PVP)
-IDX_KAPPA = 10         # Masked (PVP)
+IDX_LAT_ERR = 8        # Zero-padded (PVP) — lane detection is internal to env
+IDX_LANE_CONF = 9      # Zero-padded (PVP) — lane confidence is internal to env
+IDX_KAPPA = 10         # Zero-padded (PVP)
 IDX_DIST = 11
 
 

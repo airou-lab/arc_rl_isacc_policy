@@ -114,6 +114,10 @@ class IsaacDirectEnv(gym.Env):
         self._lane_detector = None
         self._stuck_timer = 0.0
         self._offroad_timer = 0.0
+        # Internal lane detection state — used for reward and termination
+        # only, never exposed in the observation vector (PVP compliance).
+        self._lane_lateral_offset = 0.0
+        self._lane_confidence = 0.0
 
     def _setup_sim(self):
         if self._sim_initialized: return
@@ -179,6 +183,8 @@ class IsaacDirectEnv(gym.Env):
         self._cumulative_distance = 0.0
         self._stuck_timer = 0.0
         self._offroad_timer = 0.0
+        self._lane_lateral_offset = 0.0
+        self._lane_confidence = 0.0
         self._reset_robot_pose()
         self._world.step(render=True)
         self._last_position = self._get_robot_position()
@@ -225,7 +231,7 @@ class IsaacDirectEnv(gym.Env):
 
         # Off-road: lane confidence near zero for too long (only if lane detector is available)
         if self._lane_detector is not None:
-            lane_conf = obs["vec"][9]
+            lane_conf = self._lane_confidence
             if lane_conf < self.config.offroad_confidence_threshold:
                 self._offroad_timer += step_dt
             else:
@@ -254,29 +260,32 @@ class IsaacDirectEnv(gym.Env):
     def _compute_telemetry(self):
         vec = np.zeros(12, dtype=np.float32)
         velocity = self._get_robot_velocity()
-        vec[0] = 0.0 # turn token (set by Worker node at deployment)
+        vec[0] = 0.0 # turn token (set by Worker via AgentEnvWrapper)
         vec[3] = float(np.linalg.norm(velocity[:2]))
         vec[4] = float(self._get_robot_yaw_rate())
         vec[5], vec[6], vec[7] = self._last_action
 
-        # Lane detection for reward computation (agent never sees this directly)
+        # Lane detection — stored internally for reward and termination.
+        # NOT written to vec[8:10] — those stay zero (PVP protocol).
+        # The policy must navigate from camera pixels alone.
         if self._lane_detector is not None:
             try:
                 res = self._lane_detector.detect(self._capture_camera())
-                vec[8] = float(res.lateral_offset)
-                vec[9] = float(res.confidence)
+                self._lane_lateral_offset = float(res.lateral_offset)
+                self._lane_confidence = float(res.confidence)
             except Exception as e:
                 logger.debug(f"Lane detection failed this step: {e}")
-                # vec[8] and vec[9] stay 0.0
+                self._lane_lateral_offset = 0.0
+                self._lane_confidence = 0.0
 
-        # vec [10] intentionally zero-padded (PVP protocol)
+        # vec[2], vec[8], vec[9], vec[10] intentionally zero-padded (PVP protocol)
         vec[11] = self._cumulative_distance
         return vec
 
     def _compute_reward(self, obs):
         telemetry = obs["vec"]
         speed = telemetry[3]
-        lat_err = telemetry[8]
+        lat_err = self._lane_lateral_offset  # From internal state, not obs (PVP)
         yaw_rate = telemetry[4]
 
         if speed < 0.1: return -1.0 # Force movement

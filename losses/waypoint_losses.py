@@ -206,7 +206,7 @@ class WaypointLoss:
         # Transform unsafe positions to vehicle-local frame
         unsafe_local = []
         for idx in unsafe_indices:
-            local = safe._world_to_local(positions[idx], ref_pos, ref_yaw)
+            local = self._world_to_local(positions[idx], ref_pos, ref_yaw)
             unsafe_local.append(local)
 
         unsafe_pts = torch.tensor(np.array(unsafe_local), dtype=torch.float32, device=device) # (U, 2)
@@ -220,7 +220,7 @@ class WaypointLoss:
         distances = torch.norm(pred_expanded - unsafe_expanded, dim=-1) # (B, W, U)
 
         # Hinge loss: penalty when distance < margin
-        violations = torch.clamp(self.repulsion_margin - distance, min=0.0)
+        violations = torch.clamp(self.repulsion_margin - distances, min=0.0)
         repulsion = violations.mean()
 
         return repulsion
@@ -272,7 +272,7 @@ class WaypointLoss:
         local_x = dx * cos_yaw - dz * sin_yaw # Lateral
         local_z = dx * sin_yaw + dz * cos_yaw # Forward
 
-        return np.array([local_x, local_y], dtype=np.float32)
+        return np.array([local_x, local_z], dtype=np.float32)
 
     @staticmethod
     def _find_point_at_distance(positions: np.ndarray, valid_indices: np.ndarray, ref_idx: int, target_dist: float,) -> Optional[int]:

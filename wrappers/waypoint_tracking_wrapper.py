@@ -79,7 +79,7 @@ class TrajectoryStore:
     def get_safety_mask(self, env_id: int) -> Optional[np.ndarray]:
         """Get safety mask for an environment."""
         with self._data_lock:
-            return _episode_safety.get(env_id)
+            return self._episode_safety.get(env_id)
 
     def clear(self, env_id: Optional[int] = None):
         """Clear stored data."""
@@ -204,7 +204,7 @@ class WaypointTrackingWrapper(gym.Wrapper):
                     "step": self._step_count,
                     "waypoints": self.last_predicted_waypoints.copy(),
                     "position": position.copy(),
-                    "yaw": way,
+                    "yaw": yaw,
                 }
             )
 
@@ -315,5 +315,5 @@ class WaypointTrackingWrapper(gym.Wrapper):
             "positions": np.array(self.position_history),
             "yaws": np.array(self.yaw_history),
             "safety": np.array(self.safety_history),
-            "current_idx": len(self.position_history - 1),
+            "current_idx": len(self.position_history) - 1,
         }

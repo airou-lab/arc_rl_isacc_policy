@@ -77,9 +77,9 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
     IDX_LAST_STEER = 5 # Previous steering command
     IDX_LAST_THR = 6   # Previous throttle command
     IDX_LAST_BRK = 7   # Previous brake command
-    IDX_LAT_ERR = 8    # Lateral error from path (m)
-    IDX_HDG_ERR = 9    # Heading error from path (rad)
-    IDX_KAPPA = 10     # Path curvature (1/m)
+    IDX_LAT_ERR = 8    # Zero-padded (PVP) — lane detection internal to env
+    IDX_LANE_CONF = 9  # Zero-padded (PVP) — lane confidence internal to env
+    IDX_KAPPA = 10     # Zero-padded (PVP)
     IDX_DS = 11        # Distance traveled / cumulative odometry
 
     def __init__(

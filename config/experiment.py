@@ -44,9 +44,9 @@ TELEMETRY_INDICES = {
     "last_steer": 5,          # Previous steering command
     "last_throttle": 6,       # Previous throttle command
     "last_brake": 7,          # Previous brake command
-    "lateral_offset": 8,      # Lateral offset from SimpleLaneDetector (m)
-    "lane_confidence": 9,     # Lane detection confidence [0,1] - off-road termination fires when < 0.05 for > 1s
-    "reserved": 10,           # Zero-padded  (PVP protocol - no geometry signal)
+    "lateral_offset": 8,      # Zero-padded (PVP) — lane detection is internal to env for reward/termination only
+    "lane_confidence": 9,     # Zero-padded (PVP) — lane confidence is internal to env for off-road termination only
+    "reserved": 10,           # Zero-padded (PVP protocol - no geometry signal)
     "distance_traveled": 11,  # Cumulative odometry (m)
 }
 
