@@ -32,6 +32,7 @@ class IsaacDirectConfig:
     img_height: int = 90
 
     # Vehicle geometry
+    # NOTE: URDF xacro values are 0.3302 / 0.2413 / 0.0508 - discrepancy is an open issue
     wheelbase: float = 0.33
     track_width: float = 0.28
     wheel_radius: float = 0.05
@@ -58,6 +59,13 @@ class IsaacDirectConfig:
     spawn_y: float = 62.0
     spawn_z: float = 0.5
     spawn_yaw: float = 0.0
+
+    # Termination turning
+    warmup_grace_steps: int = 10                 # Skip termination checks for first N steps after reset
+    stuck_speed_threshold: float = 0.1           # m/s - below this count as stuck
+    stuck_timeout: float = 5.0                   # seconds stuck before termination
+    offroad_confidence_threshold: float = 0.05   # lane confidence below this counts as off-road
+    offroad_timeout: float = 1.0                 # seconds off-road before termination
 
     headless: bool = True
 
@@ -118,8 +126,14 @@ class IsaacDirectEnv(gym.Env):
         # Load Lane Detector
         try:
             from lane_detector import SimpleLaneDetector
-            self._lane_detector = SimpleLaneDetector()
-        except: pass
+            self._lane_detector = SimpleLaneDetector(
+                img_width=self.config.img_width,
+                img_height=self.config.img_height,
+            )
+            logger.info("Lane detector loaded successfully")
+        except Exception as e:
+            logger.warning(f"Lane detector unavailable: {e} - off-road termination will be disabled")
+            self._lane_detector = None
 
         if self.config.usd_path:
             omni.usd.get_context().open_stage(self.config.usd_path)
@@ -185,33 +199,40 @@ class IsaacDirectEnv(gym.Env):
         self._last_position = current_pos
         self._step_count += 1
         obs = self._get_obs()
+
         # Termination
         terminated = False
         truncated = self._step_count >= self.config.max_episode_steps
         info = {"episode_step": self._step_count}
 
+        # Grace period: let physics settle after reset before checking termination
+        if self._step_count <= self.config.warmup_grace_steps:
+            reward = self._compute_reward(obs)
+            return obs, reward, False, truncated, info
+
         # Sim-time per step: substeps * physics_dt + render_dt
         step_dt = self.config.substeps * self.config.physics_dt + self.config.render_dt
 
-        # Stuck: speed < 0.1 m/s for > 5 seconds
+        # Stuck: speed below threshold for too long
         speed_now = obs["vec"][3]
-        if speed_now < 0.1:
+        if speed_now < self.config.stuck_speed_threshold:
             self._stuck_timer += step_dt
         else:
             self._stuck_timer = 0.0
-        if self._stuck_timer > 5.0:
+        if self._stuck_timer > self.config.stuck_timeout:
             terminated = True
             info["termination_reason"] = "stuck"
 
-        # Off-road: lane confidence near zero for > 1 second
-        lane_conf = obs["vec"][9]
-        if lane_conf < 0.05:
-            self._offroad_timer += step_dt
-        else:
-            self._offroad_timer = 0.0
-        if self._offroad_timer > 1.0:
-            terminated = True
-            info["termination_reason"] = "off_road"
+        # Off-road: lane confidence near zero for too long (only if lane detector is available)
+        if self._lane_detector is not None:
+            lane_conf = obs["vec"][9]
+            if lane_conf < self.config.offroad_confidence_threshold:
+                self._offroad_timer += step_dt
+            else:
+                self._offroad_timer = 0.0
+            if self._offroad_timer > self.config.offroad_timeout:
+                terminated = True
+                info["termination_reason"] = "off_road"
 
         # Fall: car fell through ground or flipped
         if current_pos[2] < -1.0 or current_pos[2] > 5.0:
@@ -233,19 +254,22 @@ class IsaacDirectEnv(gym.Env):
     def _compute_telemetry(self):
         vec = np.zeros(12, dtype=np.float32)
         velocity = self._get_robot_velocity()
-        vec[0] = 0.0 # turn_bias
+        vec[0] = 0.0 # turn token (set by Worker node at deployment)
         vec[3] = float(np.linalg.norm(velocity[:2]))
         vec[4] = float(self._get_robot_yaw_rate())
         vec[5], vec[6], vec[7] = self._last_action
 
-        # Internal Lane Detection for Reward Logic
-        if self._lane_detector:
+        # Lane detection for reward computation (agent never sees this directly)
+        if self._lane_detector is not None:
             try:
                 res = self._lane_detector.detect(self._capture_camera())
                 vec[8] = float(res.lateral_offset)
                 vec[9] = float(res.confidence)
-            except: pass
+            except Exception as e:
+                logger.debug(f"Lane detection failed this step: {e}")
+                # vec[8] and vec[9] stay 0.0
 
+        # vec [10] intentionally zero-padded (PVP protocol)
         vec[11] = self._cumulative_distance
         return vec
 

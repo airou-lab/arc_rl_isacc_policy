@@ -6,7 +6,7 @@ Hierarchical config tree:
     ExperimentConfig
     |-- SimConfig          — simulator selection, camera res, physics dt
     |-- TrainingConfig     — PPO hyperparameters, timesteps, scheduling
-    |-- PolicyConfig       — architecture choices (LSTM/Mamba, action head)
+    |-- PolicyConfig       — architecture choices (LSTM, action head)
     |-- BaselineConfig     — behavioral cloning settings (DAVE-2, etc.)
 
 Each dataclass:
@@ -24,6 +24,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/31/26
+Updated: 04/09/26
 """
 
 from dataclasses import dataclass, field, asdict
@@ -43,10 +44,10 @@ TELEMETRY_INDICES = {
     "last_steer": 5,          # Previous steering command
     "last_throttle": 6,       # Previous throttle command
     "last_brake": 7,          # Previous brake command
-    "lateral_error": 8,       # Lateral error from path (m)
-    "heading_error": 9,       # Heading error from path (rad)
-    "curvature": 10,          # Path curvature (1/m)
-    "distance_traveled": 11,  # Cumulative odometry
+    "lateral_offset": 8,      # Lateral offset from SimpleLaneDetector (m)
+    "lane_confidence": 9,     # Lane detection confidence [0,1] - off-road termination fires when < 0.05 for > 1s
+    "reserved": 10,           # Zero-padded  (PVP protocol - no geometry signal)
+    "distance_traveled": 11,  # Cumulative odometry (m)
 }
 
 TELEMETRY_DIM = 12  # Length of the vec observation
@@ -69,7 +70,7 @@ class SimConfig:
     """
 
     # Simulator selection (used by future registry/factory)
-    sim_type: str = "isaac"  # "isaac" | "gazebo" | "carla" (via envs.registry)
+    sim_type: str = "isaac"  # "isaac" | "gazebo"  (via envs.registry)
 
     # Rendering
     headless: bool = True
@@ -162,7 +163,7 @@ class PolicyConfig:
     fusion_features_dim: int = 268        # cnn + vec = 256 + 12
 
     # Temporal backbone
-    temporal_backbone: str = "lstm"       # "lstm" | "mamba" (future)
+    temporal_backbone: str = "lstm"       # "lstm" | (future)
     lstm_hidden_size: int = 256
     n_lstm_layers: int = 1
     enable_critic_lstm: bool = True
@@ -184,7 +185,7 @@ class PolicyConfig:
     max_deviation_meters: float = 8.0
 
     # Action head (forward-compatible)
-    action_head: str = "gaussian"         # "gaussian" | "flow_matching" (future)
+    action_head: str = "gaussian"         # "gaussian" | (future)
 
     # MLP extractor
     net_arch_pi: List[int] = field(default_factory=lambda: [64])
@@ -205,7 +206,7 @@ class BaselineConfig:
     """
 
     # Model selection
-    model_type: str = "dave2"             # "dave2" | "resnet_bc" (future)
+    model_type: str = "dave2"             # "dave2" | (future)
 
     # DAVE-2 specific
     input_height: int = 66               # DAVE-2 canonical crop height
