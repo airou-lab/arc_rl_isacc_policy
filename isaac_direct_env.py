@@ -60,7 +60,7 @@ class IsaacDirectConfig:
     spawn_z: float = 0.5
     spawn_yaw: float = 0.0
 
-    # Termination turning
+    # Termination tuning
     warmup_grace_steps: int = 10                 # Skip termination checks for first N steps after reset
     stuck_speed_threshold: float = 0.1           # m/s - below this count as stuck
     stuck_timeout: float = 5.0                   # seconds stuck before termination
