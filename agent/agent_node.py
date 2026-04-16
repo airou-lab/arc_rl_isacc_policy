@@ -1,6 +1,5 @@
 """
 Agent Node - Hierarchical Driver-Worker Architecture
-====================================================
 
 Each vehicle in the simulation is managed by one AgentNode, which contains two internal nodes that
 run at different levels of abstraction.
@@ -56,6 +55,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/12/26
+Updated: 04/16/26
 """
 
 from __future__ import annotations
@@ -87,8 +87,8 @@ IDX_YAW_RATE = 4
 IDX_LAST_STEER = 5
 IDX_LAST_THROTTLE = 6
 IDX_LAST_BRAKE = 7
-IDX_LAT_ERR = 8        # Zero-padded (PVP) — lane detection is internal to env
-IDX_LANE_CONF = 9      # Zero-padded (PVP) — lane confidence is internal to env
+IDX_LAT_ERR = 8        # Lateral error (m) — populated in Isaac Lab env, zeroed in PVP direct env
+IDX_HDG_ERR = 9        # Heading error (rad) — populated in Isaac Lab env, zeroed in PVP direct env
 IDX_KAPPA = 10         # Zero-padded (PVP)
 IDX_DIST = 11
 

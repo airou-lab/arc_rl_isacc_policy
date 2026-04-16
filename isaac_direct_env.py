@@ -39,7 +39,7 @@ class IsaacDirectConfig:
     Configuration for the direct-API Isaac Sim environment.
 
     Defaults are aligned with the arc_rl_isacc_sim repo (Phase 10,
-    1.0× metric scale, F1Tenth_Metric.usd).
+    1.0x metric scale, F1Tenth_Metric.usd).
     """
 
     # Scene
@@ -560,7 +560,10 @@ class IsaacDirectEnv(gym.Env):
                 self._lane_lateral_offset = 0.0
                 self._lane_confidence = 0.0
 
-        # vec[2], vec[8], vec[9], vec[10] intentionally zero-padded (PVP)
+        # vec[2] (goal_dist), vec[8] (lateral_offset), vec[9] (heading_error),
+        # vec[10] (reserved) intentionally zero-padded (PVP protocol).
+        # In Arika's Isaac Lab env these are populated by TrackManager;
+        # here they stay zero so the policy never trains on sim-only geometry.
         vec[11] = self._cumulative_distance
         return vec
 

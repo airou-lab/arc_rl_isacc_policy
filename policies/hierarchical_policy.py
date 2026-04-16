@@ -46,6 +46,7 @@ Used by:
     - inference_server_ros2.py (deployment node)
 """
 
+import warnings
 import torch
 import torch.nn as nn
 from typing import Dict, Tuple, Optional, List, Type, Any, Union
@@ -66,7 +67,8 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
     LSTM hidden state and the planned waypoints.
     """
     # Normalization constant for waypoints (meters -> normalized space)
-    WAYPOINT_NORM_SCALE = 20.0
+    # Reduced from 20.0 (8x) to 2.5 (1x)
+    WAYPOINT_NORM_SCALE = 2.5
 
     # Telemetry vector indices (must match experiment.py TELEMETRY_INDICES)
     IDX_TURN_TOKEN = 0 # Discrete turn command {-1, 0, 1} from Worker
@@ -77,9 +79,9 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
     IDX_LAST_STEER = 5 # Previous steering command
     IDX_LAST_THR = 6   # Previous throttle command
     IDX_LAST_BRK = 7   # Previous brake command
-    IDX_LAT_ERR = 8    # Zero-padded (PVP) — lane detection internal to env
-    IDX_LANE_CONF = 9  # Zero-padded (PVP) — lane confidence internal to env
-    IDX_KAPPA = 10     # Zero-padded (PVP)
+    IDX_LAT_ERR = 8    # Lateral error from path (m)
+    IDX_HDG_ERR = 9    # Heading error from path (rad)
+    IDX_KAPPA = 10     # Path curvature (1/m)
     IDX_DS = 11        # Distance traveled / cumulative odometry
 
     def __init__(
@@ -115,9 +117,9 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         use_kinematic_anchors: bool = True,
         curvature_gain: float = 0.18,
         command_blend_factor: float = 0.6,
-        steering_blend_factor: float = 0.4,
+        # Removed dead parameter steering_blend_factor=0.4
         progressive_curvature_exp: float = 1.15,
-        max_deviation_meters: float = 8.0,
+        max_deviation_meters: float = 0.5,
     ):
         """
         Initialize the hierarchical policy.
@@ -127,7 +129,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
             action_space: Gymnasium action space (Box with 3 dims: steer, throttle, brake).
             lr_schedule: Learning rate schedule function.
             num_waypoints: Number of waypoints predicted ahead.
-            waypoint_horion: Total forward distance (meters) spanned by waypoints.
+            waypoint_horizon: Total forward distance (meters) spanned by waypoints.
             repulsion_weight: Weight for crash-avoidance auxiliary loss term.
             waypoint_loss_weight: Weight for waypoint auxiliary loss vs PPO loss.
             use_kinematic_anchors: If True, compute curved anchors from turn_token + steering.
@@ -149,7 +151,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         self.use_kinematic_anchors = use_kinematic_anchors
         self.curvature_gain = curvature_gain
         self.command_blend_factor = command_blend_factor
-        self.steering_blend_factor = steering_blend_factor
+        # self.steering_blend_factor removed (dead code)
         self.progressive_curvature_exp = progressive_curvature_exp
 
         # Head dimensions
@@ -159,11 +161,26 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         # Compute spacing: e.g. horizon=2.5m, 5 waypoints -> 0.5m apart
         self.waypoint_spacing = waypoint_horizon / num_waypoints
 
-        # Cap max deviation to be reasonable for the horizon
-        self.max_deviation_meters = min(max_deviation_meters, waypoint_horizon * 0.8)
+        # max_deviation_meters default of 8.0 silently collapsed to 2.0 by min() with no indication to caller.
+        # Now emit a UserWarning when capping occurs.
+        horizon_cap = waypoint_horizon * 0.8
+        if max_deviation_meters > horizon_cap:
+            warnings.warn(
+                f"max_deviation_meters={max_deviation_meters} exceeds 80% of "
+                f"waypoint horizon ({waypoint_horizon}). Capping to {horizon_cap:.2f}m. "
+                f"Pass max_deviation_meters<={horizon_cap:.2f} to suppress this warning.",
+                UserWarning,
+                stacklevel=2,
+            )
+        self.max_deviation_meters = min(max_deviation_meters, horizon_cap)
 
         if net_arch is None:
             net_arch = dict(pi=[64], vf=[64])
+
+        # Store lr_schedule before super().__init__() — SB3 >=2.8 no longer
+        # saves it as self.lr_schedule, but we need it for the optimizer
+        # rebuild at the end of __init__.
+        self._lr_schedule_fn = lr_schedule
 
         super().__init__(
             observation_space,
@@ -189,6 +206,10 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
             enable_critic_lstm,
             lstm_kwargs,
         )
+        # NOTE: super().__init__() calls _setup_model() which creates self.optimizer
+        # via self.optimizer_class(self.parameters(), ...). All modules added AFTER this point are unknown to the
+        # optimizer. We rebuild the LSTM and all hierarchical heads below, then re-create the optimizer at the end of
+        # __init__ so every parameter is captured.
 
         # Fix LSTM input dimension if FusionFeatureExtractor changed it
         if self.lstm_actor.input_size != self.features_dim:
@@ -216,6 +237,17 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         # Runtime state for logging / visualization
         self.last_waypoints = None
         self.last_anchors = None
+
+        # Recreate optimizer AFTER all hierarchical heads are built.
+        # super().__init__() creates the optimizer before our heads exist, so planning_head,
+        # control_head, action_net, and the rebuilt LSTM would otherwise receive zero
+        # gradient updates during training.
+        _lr_fn = getattr(self, '_lr_schedule_fn', None) or getattr(self, 'lr_schedule', lambda _: 3e-4)
+        self.optimizer = self.optimizer_class(
+            self.parameters(),
+            lr=_lr_fn(1),
+            **self.optimizer_kwargs,
+        )
 
     def _create_static_anchors(self) -> torch.Tensor:
         """Create straight-line anchors (0, dist) in vehicle frame."""
@@ -300,7 +332,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         # Generate curved anchors
         anchor = torch.zeros(batch_size, self.num_waypoints, 2, device=device)
 
-        for i in range (self.num_waypoints):
+        for i in range(self.num_waypoints):
             dist = (i + 1) * self.waypoint_spacing
 
             # Progressive curvature: curves more at distance
@@ -349,14 +381,14 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
         """
         Fuse LSTM memory with planned waypoints for control.
 
-        CRITICAL: All waypoint normalization happens HERE to guarentee consistency between forward(), evaluate_actions() and
+        CRITICAL: All waypoint normalization happens HERE to guarantee consistency between forward(), evaluate_actions() and
                   get_distribution(). This was the root cause of the training instability bug in the Unity codebase.
 
         Args:
             latent_pi: (batch_size, latent_dim) LSTM output.
             waypoints: (batch_size, num_waypoints, 2) waypoint positions.
 
-        Returns: control_features: (batch_size, num_waypoints, 2) waypoint positions.
+        Returns: control_features: (batch_size, control_hidden_dim // 2) fused features for input to action net.
         """
         wp_flat = waypoints.reshape(-1, self.waypoint_dim)
         wp_norm = wp_flat / self.WAYPOINT_NORM_SCALE
@@ -423,7 +455,7 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
             latent_pi = self.mlp_extractor.forward_actor(latent_pi)
             latent_vf = self.mlp_extractor.forward_critic(latent_vf)
 
-        obs_vec = obs["vec"] if isinstance (obs, dict) else obs
+        obs_vec = obs["vec"] if isinstance(obs, dict) else obs
 
         waypoints = self._compute_waypoints(latent_pi, obs_vec)
         control_features = self._compute_control_features(latent_pi, waypoints)
@@ -510,7 +542,17 @@ class HierarchicalPathPlanningPolicy(RecurrentActorCriticPolicy):
                 if isinstance(obs_tensor, dict) and "image" in obs_tensor:
                     img = obs_tensor["image"]
                     batch_size = img.shape[0] if img.ndim > 3 else 1
-                state = self.get_initial_states(batch_size)
+                # self.get_initial_states(batch_size) does not exist on RecurrentActorCriticPolicy - would raise
+                # AttributeError on every visualization / evaluation call.
+                # Replaced with explicit zero-state construction matching the shape SB3-contrib uses internally:
+                # (n_layers, batch, hidden).
+                single_shape = (self.n_lstm_layers, batch_size, self.lstm_hidden_size)
+                zero_h = torch.zeros(single_shape, device=self.device)
+                zero_c = torch.zeros(single_shape, device=self.device)
+                state = RNNStates(
+                    pi=(zero_h, zero_c),
+                    vf=(zero_h.clone(), zero_c.clone()),
+                )
 
             if episode_start is None:
                 episode_start = np.array([False])

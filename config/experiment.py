@@ -24,7 +24,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/31/26
-Updated: 04/09/26
+Updated: 04/016/26
 """
 
 from dataclasses import dataclass, field, asdict
@@ -44,8 +44,8 @@ TELEMETRY_INDICES = {
     "last_steer": 5,          # Previous steering command
     "last_throttle": 6,       # Previous throttle command
     "last_brake": 7,          # Previous brake command
-    "lateral_offset": 8,      # Zero-padded (PVP) — lane detection is internal to env for reward/termination only
-    "lane_confidence": 9,     # Zero-padded (PVP) — lane confidence is internal to env for off-road termination only
+    "lateral_offset": 8,      # Lateral error from path (m) — populated by TrackManager in Isaac Lab env; zeroed in PVP direct env
+    "heading_error": 9,       # Heading error from path (rad) — populated by TrackManager in Isaac Lab env; zeroed in PVP direct env
     "reserved": 10,           # Zero-padded (PVP protocol - no geometry signal)
     "distance_traveled": 11,  # Cumulative odometry (m)
 }
@@ -78,17 +78,18 @@ class SimConfig:
     camera_height: int = 90
 
     # Physics
-    physics_dt: float = 1.0 / 60.0        # 60 Hz physics
-    render_dt: float = 1.0 / 30.0         # 30 Hz rendering
-    control_hz: int = 10                  # Policy inference rate
+    # Aligned with sim repo: 500 Hz physics, 20 Hz control (500/25)
+    physics_dt: float = 0.002             # 500 Hz
+    render_dt: float = 0.05               # 20 Hz (every 25th physics step)
+    control_hz: int = 20                  # Policy inference rate
 
     # Vehicle
     max_steering_angle: float = 0.5       # radians (~28.6 degrees)
     max_acceleration: float = 3.0         # m/s^2
 
     # Episode
-    episode_timeout: float = 30.0         # seconds
-    max_episode_steps: int = 300          # steps (timeout / dt)
+    episode_timeout: float = 120.0        # seconds (matching sim repo)
+    max_episode_steps: int = 2400         # 120 s x 20 Hz
 
     # Parallelization (for future vectorized envs)
     num_parallel_envs: int = 1
@@ -180,9 +181,9 @@ class PolicyConfig:
     # Kinematic anchor tuning
     curvature_gain: float = 0.18
     command_blend_factor: float = 0.6
-    steering_blend_factor: float = 0.4
+    # steering_blend_factor removed (dead code in HierarchicalPathPlanningPolicy)
     progressive_curvature_exp: float = 1.15
-    max_deviation_meters: float = 8.0
+    max_deviation_meters: float = 0.5     # 1x metric scale (was 8.0 at 8x)
 
     # Action head (forward-compatible)
     action_head: str = "gaussian"         # "gaussian" | (future)
