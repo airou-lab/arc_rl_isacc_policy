@@ -176,6 +176,16 @@ class WaypointTrackingWrapper(gym.Wrapper):
         obs, reward, done, truncated, info = self.env.step(action)
         self._step_count += 1
 
+        # Handle batched tensors
+        def _to_scalar(v):
+            if hasattr(v, "ndim") and v.ndim > 0:
+                return float(v[self.env_id].item()) if hasattr(v, "item") else float(v[self.env_id])
+            return float(v)
+
+        reward_val = _to_scalar(reward)
+        done_val = bool(_to_scalar(done))
+        truncated_val = bool(_to_scalar(truncated))
+
         # Dead-reckoning position estimate
         # (Isaac Sim does not provide ground-truth position in info dict)
         position = self._update_position_estimate(obs)
@@ -183,7 +193,8 @@ class WaypointTrackingWrapper(gym.Wrapper):
 
         # Extract speed from observation
         if isinstance(obs, dict) and "vec" in obs:
-            speed = float(obs["vec"][self.IDX_SPEED])
+            vec = obs["vec"]
+            speed = float(vec[self.env_id, self.IDX_SPEED] if vec.ndim > 1 else vec[self.IDX_SPEED])
         else:
             speed = 0.0
 
@@ -191,7 +202,7 @@ class WaypointTrackingWrapper(gym.Wrapper):
         self.position_history.append(position.copy())
         self.yaw_history.append(yaw)
         self.speed_history.append(speed)
-        self.reward_history.append(float(reward))
+        self.reward_history.append(reward_val)
 
         # Initially mark all steps as safe (1.0)
         # Backfill will mark unsafe steps when episode ends
@@ -209,8 +220,8 @@ class WaypointTrackingWrapper(gym.Wrapper):
             )
 
         # Handle episode end. Apply safety backfill
-        if done or truncated:
-            self._handle_episode_end(done, truncated, reward)
+        if done_val or truncated_val:
+            self._handle_episode_end(done_val, truncated_val, reward_val)
 
         # Add trajectory info to info dict (useful for debugging)
         info["trajectory"] = {
@@ -242,8 +253,8 @@ class WaypointTrackingWrapper(gym.Wrapper):
             return self._estimated_pos.copy()
 
         vec = obs["vec"]
-        speed = float(vec[self.IDX_SPEED])
-        yaw_rate = float(vec[self.IDX_YAW_RATE])
+        speed = float(vec[self.env_id, self.IDX_SPEED] if vec.ndim > 1 else vec[self.IDX_SPEED])
+        yaw_rate = float(vec[self.env_id, self.IDX_YAW_RATE] if vec.ndim > 1 else vec[self.IDX_YAW_RATE])
 
         # Update yaw
         self._estimated_yaw += yaw_rate * self.DT
