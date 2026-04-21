@@ -29,7 +29,7 @@ Tests everything that doesn't require Isaac Sim to be running:
     22. Syntax check all Python files
 
 Author: Aaron Hamil
-Updated: 04/16/26
+Updated: 04/20/26
 """
 
 import sys
@@ -573,6 +573,49 @@ def _make_calibrated_graph():
     graph.set_intersection_position("int_main", (0.0, 0.0), radius=3.0)
     return graph
 
+def _make_calibrated_graph_with_edges():
+    """
+    Same as _make_calibrated_graph but also populates edge geometry
+    for all four approaches. Required by Worker tests since
+    use_stop_line=True (the new default) calls infer_current_approach
+    which needs calibrated edges.
+
+    Geometry: 4-way cross at origin. Each road is a 2.5m straight
+    segment along a cardinal axis, terminating at the intersection
+    center. Road IDs match intersection_topology.json:
+        road_A enters from +Y (heading 270deg -> south)
+        road_B enters from +X (heading 180deg -> west)
+        road_C enters from -Y (heading  90deg -> north)
+        road_D enters from -X (heading   0deg -> east)
+    """
+    from agent.intersection_graph import IntersectionGraph, EdgeGeometry
+    graph = IntersectionGraph.from_json("config/intersection_topology.json")
+    graph.set_intersection_position("int_main", (0.0, 0.0), radius=1.5)
+    edges = {
+        "road_A": EdgeGeometry(
+            edge_id="road_A", length=2.5, heading=math.radians(270),
+            to_node="int_main",
+            start_position=(0.0, 2.5), end_position=(0.0, 0.0),
+        ),
+        "road_B": EdgeGeometry(
+            edge_id="road_B", length=2.5, heading=math.radians(180),
+            to_node="int_main",
+            start_position=(2.5, 0.0), end_position=(0.0, 0.0),
+        ),
+        "road_C": EdgeGeometry(
+            edge_id="road_C", length=2.5, heading=math.radians(90),
+            to_node="int_main",
+            start_position=(0.0, -2.5), end_position=(0.0, 0.0),
+        ),
+        "road_D": EdgeGeometry(
+            edge_id="road_D", length=2.5, heading=math.radians(0),
+            to_node="int_main",
+            start_position=(-2.5, 0.0), end_position=(0.0, 0.0),
+        ),
+    }
+    graph.set_geometry(edges)
+    return graph
+
 def test_worker_cruising_no_intersection():
     from agent.agent_node import WorkerNode, WorkerConfig
     from agent.intersection_graph import TurnCommand
@@ -585,38 +628,65 @@ def test_worker_cruising_no_intersection():
 test("Worker cruising on open road", test_worker_cruising_no_intersection)
 
 def test_worker_decides_at_intersection():
+    """
+    Under use_stop_line=True (default), the Worker enters DECIDING
+    with substate APPROACHING when the agent crosses the pre-gate
+    distance on a recognized approach. go_signal is held at 0.0 so
+    MainNode's brake override forces a stop.
+
+    Position: (-1.2, 0) heading east = on road_D (which spans
+    (-2.5, 0) -> (0, 0) at heading 0). distance_to_next = 1.2 <
+    layout.pre_gate_distance (1.5), so the pre-gate fires.
+    """
     from agent.agent_node import WorkerNode, WorkerConfig
     from agent.intersection_graph import TurnCommand
-    graph = _make_calibrated_graph()
+    graph = _make_calibrated_graph_with_edges()
     worker = WorkerNode("agent_0", graph, WorkerConfig(mode="random"))
-    token, go = worker.step((0.5, 0.5), heading=math.radians(270), speed=1.0)
-    assert worker.state == "committed"
+    token, go = worker.step((-1.2, 0.0), heading=0.0, speed=1.0)
+    assert worker.state == "deciding", f"state={worker.state}"
+    assert worker.substate == "approaching", f"substate={worker.substate}"
     assert token in TurnCommand.all()
-    assert go == 1.0
+    assert go == 0.0, "APPROACHING holds brake override (go=0)"
+    assert worker.current_approach_road_id == "road_D"
 
 test("Worker decides turn at intersection", test_worker_decides_at_intersection)
 
 def test_worker_route_mode():
+    """
+    Route mode picks turns from the pre-planned sequence.
+    Agent on road_A at (0, 1.2) heading south (270deg). road_A's
+    approach heading is 270deg, so this matches. Pre-gate fires
+    (distance 1.2 < 1.5), turn is committed, first route entry
+    (LEFT) is selected.
+    """
     from agent.agent_node import WorkerNode, WorkerConfig
     from agent.intersection_graph import TurnCommand
-    graph = _make_calibrated_graph()
+    graph = _make_calibrated_graph_with_edges()
     route = [TurnCommand.LEFT, TurnCommand.STRAIGHT, TurnCommand.RIGHT]
     worker = WorkerNode("agent_0", graph, WorkerConfig(mode="route", route=route))
-    token, _ = worker.step((0.5, 0.5), heading=math.radians(270), speed=1.0)
-    assert token == TurnCommand.LEFT
+    token, _ = worker.step((0.0, 1.2), heading=math.radians(270), speed=1.0)
+    assert token == TurnCommand.LEFT, f"expected LEFT={TurnCommand.LEFT}, got {token}"
 
 test("Worker route mode follows plan", test_worker_route_mode)
 
 def test_worker_reset():
+    """
+    reset() clears primary state, substate, turn_token, and all
+    stop-line bookkeeping. Scripted: enter DECIDING via pre-gate,
+    then reset, then verify clean slate.
+    """
     from agent.agent_node import WorkerNode, WorkerConfig
     from agent.intersection_graph import TurnCommand
-    graph = _make_calibrated_graph()
+    graph = _make_calibrated_graph_with_edges()
     worker = WorkerNode("agent_0", graph, WorkerConfig(mode="random"))
-    worker.step((0.5, 0.5), heading=math.radians(270), speed=1.0)
-    assert worker.state == "committed"
+    worker.step((-1.2, 0.0), heading=0.0, speed=1.0)
+    assert worker.state == "deciding"
     worker.reset()
     assert worker.state == "cruising"
+    assert worker.substate == "none"
     assert worker.turn_token == TurnCommand.STRAIGHT
+    assert worker.current_approach_road_id is None
+    assert worker.committed_exit_road_id is None
 
 test("Worker reset clears state", test_worker_reset)
 
