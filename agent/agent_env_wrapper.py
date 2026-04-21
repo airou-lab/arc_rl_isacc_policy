@@ -1,6 +1,5 @@
 """
 Agent Environment Wrapper
-=========================
 
 Gymnasium wrapper that integrates AgentNode (Worker + Main) into any
 environment that uses the 12-float telemetry vector protocol.
@@ -59,6 +58,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/12/26
+Updated: 04/20/26
 """
 
 from __future__ import annotations
@@ -143,7 +143,8 @@ class AgentEnvWrapper(gym.Wrapper):
 
         # Run Worker on initial observation to set turn_token
         pos, heading, speed = self._get_agent_state(obs)
-        self.agent.worker_step(pos, heading, speed, dt=self.control_dt)
+        image = self._extract_image(obs)
+        self.agent.worker_step(pos, heading, speed, dt=self.control_dt, image=image)
 
         # Inject Worker's commands into observation
         obs = self.agent.prepare_obs(obs)
@@ -179,9 +180,10 @@ class AgentEnvWrapper(gym.Wrapper):
 
         # 4. Get agent's world-frame state
         pos, heading, speed = self._get_agent_state(obs)
+        image = self._extract_image(obs)
 
         # 5. Worker step: check intersection, plan route, coordinate
-        self.agent.worker_step(pos, heading, speed, dt=self.control_dt)
+        self.agent.worker_step(pos, heading, speed, dt=self.control_dt, image=image)
 
         # 6. Inject Worker's commands into observation
         obs = self.agent.prepare_obs(obs)
@@ -273,3 +275,22 @@ class AgentEnvWrapper(gym.Wrapper):
             self._dr_x = 0.0
             self._dr_y = 0.0
             self._dr_heading = 0.0
+
+    def _extract_image(self, obs: Dict[str, np.ndarray]) -> Optional[np.ndarray]:
+        """
+        Pull the forward camera image out of the observation dict.
+
+        The VisualStopLineDetector expects (H, W, 3) uint8 RGB. This
+        matches IsaacDirectEnv.observation_space["image"], so we can
+        pass it through unchanged. Returns None if the obs doesn't
+        include an image key (shouldn't happen in normal flow, but
+        defensive — the Worker will warn once and fall back).
+        """
+        if not isinstance(obs, dict):
+            return None
+        img = obs.get("image")
+        if img is None:
+            return None
+        if not isinstance(img, np.ndarray):
+            return None
+        return img
