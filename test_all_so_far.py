@@ -18,7 +18,6 @@ Tests everything that doesn't require Isaac Sim to be running:
     11. Worker scheduler (conflict detection, go/wait)
     12. Agent node (Worker + Main integration)
     13. Agent environment wrapper (obs injection, action gate)
-    14. Topological EKF (predict, update, transition)
     15. Geometry calibrator (drive log processing)
     16. Lane detector (synthetic image detection)
     17. Fusion features extractor (forward pass, dims)
@@ -29,7 +28,7 @@ Tests everything that doesn't require Isaac Sim to be running:
     22. Syntax check all Python files
 
 Author: Aaron Hamil
-Updated: 04/20/26
+Updated: 04/23/26
 """
 
 import sys
@@ -831,85 +830,6 @@ def test_agent_wrapper_wraps_correctly():
 test("AgentEnvWrapper preserves spaces", test_agent_wrapper_wraps_correctly)
 
 
-# 14. TOPOLOGICAL EKF
-
-print("\n=== 14. Topological EKF ===")
-
-def _make_ekf():
-    from agent.topological_ekf import TopologicalEKF, TopologicalEKFConfig, EdgeInfo
-    from agent.intersection_graph import IntersectionGraph
-    graph = _make_calibrated_graph()
-    edges = {
-        "road_A": EdgeInfo(edge_id="road_A", from_node=None, to_node="int_main",
-                           length=20.0, heading=math.radians(270)),
-    }
-    ekf = TopologicalEKF(graph, edges)
-    return ekf
-
-def test_ekf_initialize():
-    ekf = _make_ekf()
-    ekf.initialize("road_A", s=0.0, speed=1.0)
-    state = ekf.state
-    assert state.edge_id == "road_A"
-    assert abs(state.s) < 0.01
-    assert abs(state.speed - 1.0) < 0.01
-
-test("EKF initialize on edge", test_ekf_initialize)
-
-def test_ekf_predict_advances():
-    ekf = _make_ekf()
-    ekf.initialize("road_A", s=0.0, speed=1.0)
-    for _ in range(10):
-        ekf.predict(imu_yaw_rate=0.0, odom_speed=1.0, dt=0.1)
-    state = ekf.state
-    assert state.s > 0.5, f"EKF should advance, got s={state.s}"
-
-test("EKF predict advances arc-length", test_ekf_predict_advances)
-
-def test_ekf_covariance_grows():
-    ekf = _make_ekf()
-    ekf.initialize("road_A", s=0.0, speed=1.0)
-    initial_uncertainty = ekf.position_uncertainty
-    for _ in range(50):
-        ekf.predict(imu_yaw_rate=0.0, odom_speed=1.0, dt=0.1)
-    assert ekf.position_uncertainty > initial_uncertainty
-
-test("EKF covariance grows over time", test_ekf_covariance_grows)
-
-def test_ekf_lane_update_corrects():
-    ekf = _make_ekf()
-    ekf.initialize("road_A", s=5.0, d=0.5, speed=1.0)
-    # Inflate D-covariance so Kalman gain is non-trivial
-    ekf._P[ekf.D, ekf.D] = 1.0
-    pre_d = float(ekf._x[ekf.D])
-    ekf.update_lane(lateral_offset=0.0, confidence=1.0)
-    post_d = float(ekf._x[ekf.D])
-    # NOTE: ekf.state.d would still show 0.5 because _update_topo_state()
-    # isn't called after measurement updates (known staleness, not in scope).
-    # Reading _x directly verifies the Kalman math works.
-    assert abs(post_d) < abs(pre_d), \
-        f"Lane update should pull d toward measurement: pre={pre_d:.4f}, post={post_d:.4f}"
-
-test("EKF lane update corrects lateral", test_ekf_lane_update_corrects)
-
-def test_ekf_edge_transition():
-    ekf = _make_ekf()
-    ekf.initialize("road_A", s=0.0, speed=1.0)
-    ekf.transition_to_edge("road_A")
-    assert ekf.state.s == 0.0
-    assert ekf.position_uncertainty < 0.2
-
-test("EKF edge transition resets covariance", test_ekf_edge_transition)
-
-def test_ekf_at_intersection_flag():
-    ekf = _make_ekf()
-    ekf.initialize("road_A", s=19.6, speed=1.0)
-    ekf.predict(imu_yaw_rate=0.0, odom_speed=1.0, dt=0.1)
-    assert ekf.state.at_intersection
-
-test("EKF at_intersection flag triggers", test_ekf_at_intersection_flag)
-
-
 # 15. GEOMETRY CALIBRATOR
 
 print("\n=== 15. Geometry Calibrator ===")
@@ -1328,7 +1248,6 @@ all_files = [
     "agent/agent_env_wrapper.py",
     "agent/intersection_graph.py",
     "agent/worker_scheduler.py",
-    "agent/topological_ekf.py",
     "agent/geometry_calibrator.py",
     "tests/__init__.py",
     "tests/test_registry.py",

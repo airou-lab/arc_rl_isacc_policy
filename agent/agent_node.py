@@ -78,8 +78,7 @@ from agent.intersection_geometry import (
     approach_axes,
     infer_current_approach,
     detect_exited_road,
-    project_to_approach_frenet,
-    within_pre_gate,
+    within_pre_gate_planar,
 )
 from agent.stop_line_detector import (
     StopLineDetection,
@@ -88,7 +87,8 @@ from agent.stop_line_detector import (
     StopLineDetectorBase,
     make_stop_line_detector,
 )
-from agent.topological_ekf import TopologicalState
+# TopologicalEKF / TopologicalState removed — see branch
+# `legacy/frenet-topological` for the shelved deployment-side path.
 
 logger = logging.getLogger(__name__)
 
@@ -316,11 +316,13 @@ class WorkerNode:
         """
         Worker step using GLOBAL position (PhysX ground truth).
 
-        Called every environment step by AgentNode.step().
-        For topological EKF position, use step_topological() instead.
+        Called every environment step by AgentNode.step(). The active
+        path uses global (x, y) and a planar pre-gate against the
+        intersection center. The EKF-native step_topological() path is
+        shelved on branch `legacy/frenet-topological`.
 
         Args:
-            position: (x, y) in world frame from PhysX or EKF global estimate.
+            position: (x, y) in world frame from PhysX.
             heading: Agent heading in radians.
             speed: Agent speed in m/s.
             dt: Time since last step (for cooldown decay and substate timing).
@@ -474,17 +476,20 @@ class WorkerNode:
             return
         road_id, approach_info = approach
 
-        # Frenet projection on that approach
-        edge = self.graph.get_edge_geometry(road_id)
-        if edge is None:
+        # Planar pre-gate: arm iff agent is within pre_gate_distance of
+        # the intersection center along the approach axis. No Frenet,
+        # no arc-length, no edge geometry lookup — the JSON topology
+        # already gives us the intersection position and approach
+        # heading, which is everything we need.
+        if intersection.position is None:
+            # Graph not calibrated for this node — can't gate. Bail.
             return
-        try:
-            frenet = project_to_approach_frenet(position, heading, speed, edge)
-        except ValueError:
-            return
-
-        # Pre-gate: armed iff s-distance to downstream node is small
-        if not within_pre_gate(frenet, self.config.layout):
+        if not within_pre_gate_planar(
+            position,
+            intersection.position,
+            approach_info.heading_rad,
+            self.config.layout,
+        ):
             return
 
         # Promote to DECIDING. Pick turn now so turn_token is stable
@@ -695,190 +700,6 @@ class WorkerNode:
             active=True,
         )
         self._last_detection = self._detector.detect(ctx)
-
-    def step_topological(
-        self,
-        edge_id: str,
-        at_intersection: bool,
-        downstream_node_id: Optional[str],
-        heading: float,
-        speed: float,
-        position: Tuple[float, float] = (0.0, 0.0),
-        dt: float = 1.0 / 10.0,
-        scheduler=None,
-        image: Optional[np.ndarray] = None,
-        frenet: Optional[TopologicalState] = None,
-    ) -> Tuple[int, float]:
-        """
-        Worker step using TOPOLOGICAL position from EKF.
-
-        Instead of converting back to global coords and doing a radius
-        check, this directly uses the EKF's knowledge of which edge
-        we're on and whether we've reached the downstream node.
-
-        This eliminates the failure mode where global drift causes
-        missed intersection triggers.
-
-        Args:
-            edge_id: Current road segment from EKF.
-            at_intersection: True if EKF says s >= (edge_length - threshold).
-            downstream_node_id: The intersection at the end of this edge.
-            heading: Edge heading + theta_err from EKF.
-            speed: Current speed from EKF.
-            position: Global position estimate (for scheduler only).
-            dt: Time since last step.
-            scheduler: Optional WorkerScheduler.
-            image: Forward camera image (visual stop-line detector only).
-            frenet: Full TopologicalState from EKF. If provided and
-                use_stop_line=True, pre-gate uses frenet.distance_to_next
-                for robust arc-length arming. Legacy path ignores this.
-
-        Returns:
-            (turn_token, go_signal) to inject into vec[0:2].
-        """
-        self._total_steps += 1
-
-        if self._cooldown_remaining > 0:
-            self._cooldown_remaining = max(0.0, self._cooldown_remaining - dt)
-
-        # Legacy path (use_stop_line=False): original topological flow.
-        if not self.config.use_stop_line:
-            self._step_topological_legacy(
-                at_intersection, downstream_node_id, heading, speed, position, scheduler
-            )
-            return self._turn_token, self._go_signal
-
-        # Stop-line-enabled topological path.
-        #
-        # The EKF already gives us arc-length distance to the downstream
-        # node via frenet.distance_to_next. We use that directly as our
-        # pre-gate (no global (x, y) projection needed at deployment).
-        #
-        # `at_intersection` from the EKF is the HARD threshold (we've
-        # entered the intersection geometry). The pre-gate fires earlier
-        # at layout.pre_gate_distance.
-
-        # Resolve the downstream intersection if any
-        intersection: Optional[IntersectionNode] = None
-        if downstream_node_id is not None:
-            intersection = self.graph.get_intersection(downstream_node_id)
-
-        pre_gate_armed = False
-        if frenet is not None and frenet.edge_length > 0:
-            pre_gate_armed = within_pre_gate(frenet, self.config.layout)
-        elif at_intersection:
-            # No Frenet supplied but EKF says we're at the node — arm anyway
-            pre_gate_armed = True
-
-        # CRUISING: promote on pre-gate (same logic as global path, but
-        # the approach is already known from the EKF edge_id)
-        if self._state == self.CRUISING:
-            if (
-                pre_gate_armed
-                and downstream_node_id is not None
-                and intersection is not None
-                and not (
-                    downstream_node_id == self._last_intersection_id
-                    and self._cooldown_remaining > 0
-                )
-            ):
-                # Identify approach by edge_id (deployment-native —
-                # no heading-match fallback needed, the EKF KNOWS the edge)
-                approach_info = intersection.approaches.get(edge_id)
-                if approach_info is not None:
-                    self._state = self.DECIDING
-                    self._substate = self.SUB_APPROACHING
-                    self._current_intersection = downstream_node_id
-                    self._current_approach_road_id = edge_id
-                    self._stop_dwell_elapsed = 0.0
-                    self._decide_turn(intersection, heading, speed, position, scheduler)
-                    if self._turn_token in approach_info.exits:
-                        self._committed_exit_road_id = approach_info.exits[self._turn_token].exit_road_id
-                    else:
-                        self._committed_exit_road_id = None
-                    self._go_signal = 0.0
-                    self._run_detector(position, heading, intersection, image)
-
-        elif self._state == self.DECIDING:
-            self._handle_deciding(position, heading, speed, dt, scheduler, image)
-
-        elif self._state == self.COMMITTED:
-            # Topological EXITED signal: EKF has transitioned onto a new
-            # edge AND it's not the same one we approached on. This is
-            # more robust than world-frame exit detection at deployment.
-            if not at_intersection and edge_id != self._current_approach_road_id:
-                # EKF says we're on a new edge — that edge_id IS the
-                # exited road
-                self._substate = self.SUB_EXITED
-                self._exited_road_id = edge_id
-                self._exit_correct = (
-                    self._committed_exit_road_id is not None
-                    and edge_id == self._committed_exit_road_id
-                )
-                self._finish_intersection(exited_road=edge_id)
-            else:
-                # Still inside — allow RVO updates
-                if scheduler is not None and self._current_intersection is not None:
-                    self._go_signal = scheduler.query_go_signal(
-                        self.agent_id,
-                        self._current_intersection,
-                        self._turn_token,
-                        position,
-                        heading,
-                        speed,
-                    )
-
-        if self._state == self.CRUISING and self._substate == self.SUB_NONE:
-            self._go_signal = 1.0
-
-        return self._turn_token, self._go_signal
-
-    def _step_topological_legacy(
-        self,
-        at_intersection: bool,
-        downstream_node_id: Optional[str],
-        heading: float,
-        speed: float,
-        position: Tuple[float, float],
-        scheduler,
-    ) -> None:
-        """Original topological flow (use_stop_line=False)."""
-        if self._state == self.CRUISING:
-            if at_intersection and downstream_node_id is not None:
-                if (
-                    downstream_node_id == self._last_intersection_id
-                    and self._cooldown_remaining > 0
-                ):
-                    pass
-                else:
-                    intersection = self.graph.get_intersection(downstream_node_id)
-                    if intersection is not None:
-                        self._state = self.DECIDING
-                        self._current_intersection = downstream_node_id
-                        self._decide_turn(
-                            intersection, heading, speed, position, scheduler
-                        )
-                        self._state = self.COMMITTED
-
-        elif self._state == self.COMMITTED:
-            if not at_intersection:
-                self._last_intersection_id = self._current_intersection
-                self._cooldown_remaining = self.config.intersection_cooldown
-                self._current_intersection = None
-                self._state = self.CRUISING
-            else:
-                if scheduler is not None:
-                    self._go_signal = scheduler.query_go_signal(
-                        self.agent_id,
-                        self._current_intersection,
-                        self._turn_token,
-                        position,
-                        heading,
-                        speed,
-                    )
-
-        if self._state == self.CRUISING:
-            self._go_signal = 1.0
 
     def _decide_turn(
         self,
@@ -1203,48 +1024,6 @@ class AgentNode:
             dt=dt,
             scheduler=self.scheduler,
             image=image,
-        )
-        self._last_turn_token = token
-        self._last_go_signal = go
-        return token, go
-
-    def worker_step_topological(
-        self,
-        ekf_state,
-        downstream_node_id: Optional[str],
-        position: Tuple[float, float] = (0.0, 0.0),
-        dt: float = 0.1,
-        image: Optional[np.ndarray] = None,
-    ) -> Tuple[int, float]:
-        """
-        Run the Worker using topological EKF state.
-
-        Uses the EKF's edge-based position directly instead of
-        converting back to global coordinates. This is the deployment
-        path — robust to odometry drift because intersection detection
-        is based on arc-length along the edge, not global distance.
-
-        Args:
-            ekf_state: TopologicalState from the EKF.
-            downstream_node_id: Intersection at end of current edge.
-            position: Global estimate (for scheduler RVO only).
-            dt: Time since last call.
-            image: Forward camera image for the stop-line detector.
-
-        Returns:
-            (turn_token, go_signal) to be injected into obs.
-        """
-        token, go = self.worker.step_topological(
-            edge_id=ekf_state.edge_id,
-            at_intersection=ekf_state.at_intersection,
-            downstream_node_id=downstream_node_id,
-            heading=ekf_state.edge_heading + ekf_state.theta_err,
-            speed=ekf_state.speed,
-            position=position,
-            dt=dt,
-            scheduler=self.scheduler,
-            image=image,
-            frenet=ekf_state,
         )
         self._last_turn_token = token
         self._last_go_signal = go

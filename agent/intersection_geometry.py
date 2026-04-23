@@ -1,53 +1,44 @@
 """
-Intersection Geometry — Frenet Projection + Map Pre-Gate
+Intersection Geometry — Planar Pre-Gate + Approach Helpers
 
 Stateless geometric helpers used by the Worker's intersection logic.
 
 Purpose:
-    1. Synthesize a TopologicalState from global (x, y, heading) at
-       TRAINING time so the Worker's substate machine runs on the same
-       data shape the EKF emits at DEPLOYMENT (see agent/topological_ekf.py).
-       Training path and deployment path feed the Worker identically.
+    1. Compute the map-based pre-gate: "am I close enough to an
+       intersection along my approach axis that the stop-line detector
+       should be armed?" Planar Cartesian check, no Frenet, no EKF.
 
-    2. Compute the map-based pre-gate: "am I close enough to an
-       intersection that the visual stop-line detector should be armed?"
-       This is cheap (scalar arithmetic) and stable. It does NOT tell us
-       where the stop line IS — that's the detector's job. It only tells
-       us whether looking for one is worthwhile.
+    2. Compute per-approach geometric quantities (stop-line center,
+       distance-to-stop-line, exit-road detection) used by the Worker's
+       substate machine and the GeometricStopLineDetector.
 
-    3. Compute per-approach geometric quantities (stop-line center,
-       distance-along-approach) used by the GeometricStopLineDetector
-       as a bootstrap fallback when the scene lacks visible stop-line
-       meshes or the CV pipeline hasn't been validated yet.
-
-Scope: this module is simulator-agnostic. Pure Python + math module,
-no numpy / torch / cv2. Scalar inputs, scalar outputs. It drops into
-Arika's torch-based Isaac Lab managers without a rewrite.
+Scope: simulator-agnostic. Pure Python + math module. Scalar inputs,
+scalar outputs.
 
 Frame conventions (matching the rest of the repo):
     - World frame: +X right, +Y up, Z up (Isaac Sim convention).
     - Heading: radians, 0 = +X, pi/2 = +Y, counter-clockwise.
     - An approach heading is the direction the car faces when driving
       TOWARD the intersection center (not away from it).
-    - Frenet s: arc-length along an edge, measured from the upstream
-      end. s increases in the direction of travel toward the downstream
-      intersection. This matches TopologicalState.s.
-    - Frenet d: lateral offset from the road centerline. Positive d is
-      to the DRIVER'S RIGHT (matches TopologicalEKF convention).
-      For right-hand-drive North American roads, an agent correctly
-      placed in its approach lane has d ~= +lane_half_width.
+
+History:
+    This module previously contained Frenet projection utilities
+    (project_to_approach_frenet, the old within_pre_gate) that fed
+    a TopologicalEKF-shaped signal to the Worker. That path is shelved
+    on branch `legacy/frenet-topological`. The planar pre-gate is the
+    minimal 2D replacement — the Worker only ever needed "is the agent
+    within pre_gate_distance of the intersection along its approach
+    axis?" which does not require arc-length tracking.
 
 PVP note:
-    Everything in this module is privileged at training (uses world-frame
-    ground-truth position). The OUTPUTS (TopologicalState + pre-gate bool)
-    are deployment-realizable because the EKF produces the same shape
-    from real sensors. The privileged geometry never enters the policy
-    observation vector, and the reward wrapper does not consume meters
-    from this module — it consumes Worker state and detector output,
-    both of which are one layer removed.
+    Everything in this module operates on world-frame ground-truth
+    position. Outputs feed the Worker's classical planner, never the
+    Driver's observation vector. The Worker's outputs to the Driver
+    (turn_token, go_signal) remain discrete/bounded.
 
 Author: Aaron Hamil
 Date: 04/20/26
+Updated: 04/23/26 — Frenet path shelved, planar pre-gate added.
 """
 
 from __future__ import annotations
@@ -60,9 +51,7 @@ from agent.intersection_graph import (
     IntersectionGraph,
     IntersectionNode,
     ApproachInfo,
-    EdgeGeometry,
 )
-from agent.topological_ekf import TopologicalState
 
 
 # Intersection Layout
@@ -72,9 +61,7 @@ class IntersectionLayout:
     """
     Physical dimensions of a single intersection, in meters.
 
-    All values are at 1.0x metric scale (F1TENTH-native). For Arika's
-    current scene scaled from 8x -> 1x, these defaults target a
-    ~1.0m-wide road with a 1.0m-square intersection box.
+    All values are at 1.0x metric scale (F1TENTH-native).
 
     Attributes:
         intersection_half_width: Distance from intersection center to
@@ -83,14 +70,13 @@ class IntersectionLayout:
         lane_half_width: Half the width of a single travel lane.
             For right-hand-drive, the approach lane centerline is
             offset by +lane_half_width from the road centerline.
-        pre_gate_distance: Arc-length from the downstream intersection
-            below which the stop-line detector is armed. This is the
-            map-based pre-gate radius in Frenet s-space. Distinct from
-            IntersectionNode.radius (the 2D trigger used by the legacy
-            WorkerNode.step path).
+        pre_gate_distance: Signed along-approach distance from the
+            intersection center below which the stop-line detector is
+            armed. The Worker's planar pre-gate fires when the agent
+            is between 0 and pre_gate_distance meters OUT from center
+            along the approach axis.
         stop_line_tolerance: Longitudinal tolerance for "stopped at
-            the stop line" when evaluating final-stop proximity. Used
-            by IntersectionRewardWrapper; not consumed here.
+            the stop line" when evaluating final-stop proximity.
         exit_detection_radius: Along-edge distance past the intersection
             center at which the agent is considered "committed to an
             exit road". Used for completion logic.
@@ -182,113 +168,77 @@ def stop_line_center_world(
     return (x, y)
 
 
-# Frenet Projection (Training-side synthesis of TopologicalState)
+# Planar Pre-Gate (replaces the Frenet pre-gate)
 
-def project_to_approach_frenet(
+def signed_distance_along_approach(
     agent_xy: Tuple[float, float],
-    agent_heading_rad: float,
-    agent_speed: float,
-    edge: EdgeGeometry,
-) -> TopologicalState:
+    intersection_center: Tuple[float, float],
+    approach_heading_rad: float,
+) -> float:
     """
-    Project a world-frame agent pose onto an approach edge in Frenet.
+    Signed along-approach distance from the intersection center to the
+    agent.
 
-    At training time, we don't have the EKF running — but the Worker's
-    substate machine expects TopologicalState-shaped input. This function
-    synthesizes the same shape from privileged world-frame data.
+    Positive while the agent is still approaching (i.e. upstream of
+    the intersection along the approach road).
+    Negative once the agent has crossed the intersection center.
 
-    At deployment, TopologicalEKF.state produces the identical object
-    from real sensors. The Worker cannot distinguish the two paths.
-
-    Assumes the edge is a straight segment (1D approach). This is true
-    for all current intersection approaches per project convention;
-    curved edges will need a spline-based version later.
+    This is the planar replacement for the old Frenet distance_to_next
+    signal. Derivation:
+        along points TOWARD the center (approach direction).
+        (agent - center) dotted with -along gives the distance from the
+        center outward along the approach road.
 
     Args:
         agent_xy: World (x, y) of the agent.
-        agent_heading_rad: Agent heading (radians, world frame).
-        agent_speed: Agent speed (m/s).
-        edge: EdgeGeometry for the approach the agent is on. Must have
-            start_position, end_position, heading, length populated
-            (i.e. the graph must be calibrated).
+        intersection_center: World (x, y) of the intersection.
+        approach_heading_rad: Approach heading (direction TOWARD the
+            intersection center).
 
     Returns:
-        TopologicalState with edge_id, s, d, theta_err, speed,
-        edge_length, edge_heading filled in. start_position and
-        end_position define the 1D axis.
-
-    Raises:
-        ValueError: if edge lacks calibrated start/end positions.
+        Signed meters. Positive = agent is still approaching.
     """
-    if edge.start_position is None or edge.end_position is None:
-        raise ValueError(
-            f"Cannot project onto edge '{edge.edge_id}': missing "
-            f"calibrated start_position or end_position. Run the "
-            f"GeometryCalibrator first."
-        )
-
-    ex = edge.end_position[0] - edge.start_position[0]
-    ey = edge.end_position[1] - edge.start_position[1]
-    edge_len_sq = ex * ex + ey * ey
-    if edge_len_sq < 1e-9:
-        raise ValueError(f"Degenerate edge '{edge.edge_id}' (zero length)")
-
-    # Agent relative to edge start
-    rx = agent_xy[0] - edge.start_position[0]
-    ry = agent_xy[1] - edge.start_position[1]
-
-    # s = projection onto edge direction (already length-normalized dot)
-    s = (rx * ex + ry * ey) / math.sqrt(edge_len_sq)
-
-    # d = signed lateral offset (cross product sign convention:
-    # positive d on the RIGHT of travel direction, matching TopologicalEKF)
-    # 2D cross product (ex, ey) x (rx, ry) = ex*ry - ey*rx
-    # That gives left-positive. We want right-positive, so negate.
-    cross = ex * ry - ey * rx
-    d = -cross / math.sqrt(edge_len_sq)
-
-    # Heading error = agent heading - edge heading
-    theta_err = _angle_diff(agent_heading_rad, edge.heading)
-
-    return TopologicalState(
-        edge_id=edge.edge_id,
-        s=float(s),
-        d=float(d),
-        theta_err=float(theta_err),
-        speed=float(agent_speed),
-        edge_length=float(edge.length),
-        edge_heading=float(edge.heading),
-    )
+    along, _ = approach_axes(approach_heading_rad)
+    rx = agent_xy[0] - intersection_center[0]
+    ry = agent_xy[1] - intersection_center[1]
+    return -(rx * along[0] + ry * along[1])
 
 
-# Map Pre-Gate (for arming the stop-line detector)
-
-def within_pre_gate(
-    frenet: TopologicalState,
+def within_pre_gate_planar(
+    agent_xy: Tuple[float, float],
+    intersection_center: Tuple[float, float],
+    approach_heading_rad: float,
     layout: IntersectionLayout,
 ) -> bool:
     """
-    Map-based pre-gate: should the visual stop-line detector be armed?
+    Planar Cartesian pre-gate: should the stop-line detector arm?
 
-    True iff the agent is within `pre_gate_distance` of the downstream
-    intersection along the current edge. Uses arc-length (s-space),
-    not 2D Euclidean, so long straight approaches don't false-trigger
-    at 3m out while short approaches still arm in time.
+    True iff the agent is on the approach side of the intersection
+    (signed distance >= 0) AND within layout.pre_gate_distance meters
+    of the center along the approach axis.
 
     This is the collaboration point between map knowledge and vision:
     the map says "an intersection is coming up"; the detector then
     runs and says "here is the white stripe, N meters ahead".
 
+    Replaces the Frenet-based within_pre_gate from the shelved
+    agent.topological_ekf path. Behavior on straight approach edges
+    is identical — signed distance along approach equals edge_length - s.
+
     Args:
-        frenet: Current Frenet state (from EKF or projection).
+        agent_xy: World (x, y) of the agent.
+        intersection_center: World (x, y) of the intersection.
+        approach_heading_rad: Approach heading (direction TOWARD the
+            intersection center).
         layout: Intersection layout config.
 
     Returns:
         True if the detector should run this frame.
     """
-    if frenet.edge_length <= 0:
-        return False
-    return frenet.distance_to_next <= layout.pre_gate_distance
+    d = signed_distance_along_approach(
+        agent_xy, intersection_center, approach_heading_rad
+    )
+    return 0.0 <= d <= layout.pre_gate_distance
 
 
 # Infer current approach / exit road
@@ -304,9 +254,13 @@ def infer_current_approach(
     Identify which approach the agent is currently on at a given node.
 
     Uses the same best-heading-match rule as IntersectionGraph but
-    additionally returns the matched road_id so callers can look up
-    edge geometry. Also requires the matched approach's edge geometry
-    to be available (for Frenet projection downstream).
+    additionally returns the matched road_id so callers can reference
+    per-approach data downstream.
+
+    Unlike the previous version, this does NOT require edge geometry
+    to be present — the planar pre-gate only needs the intersection
+    center (on IntersectionNode) and the approach heading (on
+    ApproachInfo), both of which are populated from the topology JSON.
 
     Args:
         agent_xy: World (x, y) of the agent (reserved — currently only
@@ -314,7 +268,9 @@ def infer_current_approach(
             shouldn't happen in well-formed 4-way topologies).
         agent_heading_rad: Agent heading in world frame.
         node: The IntersectionNode in question.
-        graph: The containing graph (for edge geometry lookup).
+        graph: The containing graph (unused in the planar path; kept
+            for signature compatibility with callers that expected the
+            Frenet version's edge lookup).
         heading_tolerance_rad: Max allowed heading mismatch for a
             match. Default 35deg; generous enough to tolerate turn
             wobble without matching a perpendicular approach.
@@ -322,6 +278,8 @@ def infer_current_approach(
     Returns:
         (road_id, ApproachInfo) if a match is found; None otherwise.
     """
+    del agent_xy, graph  # reserved / signature-compatible
+
     best_road_id: Optional[str] = None
     best_approach: Optional[ApproachInfo] = None
     best_diff = float("inf")
@@ -334,10 +292,6 @@ def infer_current_approach(
             best_diff = diff
 
     if best_road_id is None or best_approach is None:
-        return None
-
-    # Require edge geometry to exist (so downstream projection works)
-    if graph.get_edge_geometry(best_road_id) is None:
         return None
 
     return (best_road_id, best_approach)

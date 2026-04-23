@@ -1,6 +1,5 @@
 """
 Agent Module — Hierarchical Driver-Worker Architecture
-======================================================
 
 Each vehicle is managed by an AgentNode containing:
     - Worker node: route planning via intersection graph
@@ -13,6 +12,7 @@ route planning and multi-agent intersection coordination.
 
 Author: Aaron Hamil
 Date: 03/12/16
+Updated: 04/23/26
 """
 
 from agent.agent_node import (
@@ -36,13 +36,8 @@ from agent.worker_scheduler import (
     SchedulerConfig,
 )
 from agent.agent_env_wrapper import AgentEnvWrapper
-from agent.topological_ekf import (
-    TopologicalEKF,
-    TopologicalEKFConfig,
-    TopologicalState,
-    EdgeInfo,
-    build_edge_info_from_graph,
-)
+# TopologicalEKF / TopologicalState removed — see branch
+# `legacy/frenet-topological` for the shelved deployment-side path.
 from agent.geometry_calibrator import (
     GeometryCalibrator,
     CalibrationConfig,
@@ -62,11 +57,6 @@ __all__ = [
     "WorkerScheduler",
     "SchedulerConfig",
     "AgentEnvWrapper",
-    "TopologicalEKF",
-    "TopologicalEKFConfig",
-    "TopologicalState",
-    "EdgeInfo",
-    "build_edge_info_from_graph",
     "GeometryCalibrator",
     "CalibrationConfig",
     "IDX_TURN_TOKEN",
