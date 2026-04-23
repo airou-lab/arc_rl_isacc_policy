@@ -18,6 +18,7 @@ Tests everything that doesn't require Isaac Sim to be running:
     11. Worker scheduler (conflict detection, go/wait)
     12. Agent node (Worker + Main integration)
     13. Agent environment wrapper (obs injection, action gate)
+    14. Planar path planner (geometry, Worker integration)
     15. Geometry calibrator (drive log processing)
     16. Lane detector (synthetic image detection)
     17. Fusion features extractor (forward pass, dims)
@@ -830,6 +831,101 @@ def test_agent_wrapper_wraps_correctly():
 test("AgentEnvWrapper preserves spaces", test_agent_wrapper_wraps_correctly)
 
 
+# 14. PLANAR PATH PLANNER
+
+print("\n=== 14. Planar Path Planner ===")
+
+def test_planar_planner_construction():
+    from agent.planar_planner import PlanarPathPlanner
+    planner = PlanarPathPlanner(exit_plan_ahead_m=1.5)
+    assert planner is not None
+
+test("Planar planner constructs", test_planar_planner_construction)
+
+def test_planar_planner_straight_right_lane():
+    """STRAIGHT plan keeps all post-wp0 waypoints in the right lane."""
+    from agent.planar_planner import PlanarPathPlanner
+    from agent.intersection_geometry import IntersectionLayout
+    from agent.intersection_graph import TurnCommand
+    graph = _make_calibrated_graph_with_edges()
+    node = graph.get_intersection("int_main")
+    layout = IntersectionLayout()
+    planner = PlanarPathPlanner()
+    plan = planner.plan(
+        current_xy=(-1.2, 0.0), current_heading=0.0,
+        intersection=node,
+        entry_road_id="road_D", exit_road_id="road_B",
+        turn_command=TurnCommand.STRAIGHT, layout=layout,
+    )
+    assert plan is not None
+    assert plan.num_waypoints == 5
+    # Right lane on D->B axis is y = -lane_half_width.
+    for wp in plan.waypoints[1:]:
+        assert abs(wp.y - (-layout.lane_half_width)) < 1e-6
+
+test("Planar planner STRAIGHT: right-lane polyline", test_planar_planner_straight_right_lane)
+
+def test_planar_planner_rejects_past_center():
+    from agent.planar_planner import PlanarPathPlanner
+    from agent.intersection_geometry import IntersectionLayout
+    from agent.intersection_graph import TurnCommand
+    graph = _make_calibrated_graph_with_edges()
+    node = graph.get_intersection("int_main")
+    plan = PlanarPathPlanner().plan(
+        current_xy=(+1.0, 0.0), current_heading=0.0,
+        intersection=node,
+        entry_road_id="road_D", exit_road_id="road_B",
+        turn_command=TurnCommand.STRAIGHT, layout=IntersectionLayout(),
+    )
+    assert plan is None
+
+test("Planar planner rejects past-center vehicle", test_planar_planner_rejects_past_center)
+
+def test_planar_planner_cross_track_zero_on_path():
+    from agent.planar_planner import PlanarPathPlanner
+    from agent.intersection_geometry import IntersectionLayout
+    from agent.intersection_graph import TurnCommand
+    graph = _make_calibrated_graph_with_edges()
+    node = graph.get_intersection("int_main")
+    layout = IntersectionLayout()
+    plan = PlanarPathPlanner().plan(
+        current_xy=(-1.2, 0.0), current_heading=0.0,
+        intersection=node,
+        entry_road_id="road_D", exit_road_id="road_B",
+        turn_command=TurnCommand.STRAIGHT, layout=layout,
+    )
+    assert plan is not None
+    # (0, -lane_half_width) sits directly on the in-lane midpoint
+    # segment inside the intersection box.
+    d = plan.cross_track_distance((0.0, -layout.lane_half_width))
+    assert d < 1e-6, f"expected ~0, got {d}"
+
+test("Planar planner cross-track ~= 0 on the path", test_planar_planner_cross_track_zero_on_path)
+
+def test_worker_generates_plan_on_pre_gate():
+    """WorkerNode.current_plan populates when pre-gate arms."""
+    from agent.agent_node import WorkerNode, WorkerConfig
+    from agent.intersection_geometry import IntersectionLayout
+    from agent.intersection_graph import TurnCommand
+    graph = _make_calibrated_graph_with_edges()
+    worker = WorkerNode(
+        agent_id="a0", graph=graph,
+        config=WorkerConfig(
+            use_stop_line=True, detector_kind="geometric",
+            layout=IntersectionLayout(),
+            mode="route", route=[TurnCommand.STRAIGHT],
+        ),
+    )
+    assert worker.current_plan is None
+    worker.step(position=(-1.2, 0.0), heading=0.0, speed=1.0, dt=0.05)
+    assert worker.current_plan is not None
+    assert worker.current_plan.num_waypoints == 5
+    assert worker.current_plan.entry_road_id == "road_D"
+
+test("Worker populates current_plan at pre-gate promotion",
+     test_worker_generates_plan_on_pre_gate)
+
+
 # 15. GEOMETRY CALIBRATOR
 
 print("\n=== 15. Geometry Calibrator ===")
@@ -1247,6 +1343,8 @@ all_files = [
     "agent/agent_node.py",
     "agent/agent_env_wrapper.py",
     "agent/intersection_graph.py",
+    "agent/intersection_geometry.py",
+    "agent/planar_planner.py",
     "agent/worker_scheduler.py",
     "agent/geometry_calibrator.py",
     "tests/__init__.py",

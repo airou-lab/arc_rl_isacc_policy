@@ -55,7 +55,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/12/26
-Updated: 04/20/26
+Updated: 04/23/26
 """
 
 from __future__ import annotations
@@ -86,6 +86,10 @@ from agent.stop_line_detector import (
     StopLineDetectorConfig,
     StopLineDetectorBase,
     make_stop_line_detector,
+)
+from agent.planar_planner import (
+    PlanarPathPlanner,
+    PlanarPath,
 )
 # TopologicalEKF / TopologicalState removed — see branch
 # `legacy/frenet-topological` for the shelved deployment-side path.
@@ -145,7 +149,7 @@ class WorkerConfig:
                       Requires an image kwarg on every WorkerNode.step call.
         "geometric" — privileged world-frame bootstrap. Training-only.
                       Use this until the visual pipeline is validated on
-                      Arika's scene; then flip to "visual" via config.
+                      scene; then flip to "visual" via config.
     """
 
     detector_config: StopLineDetectorConfig = field(default_factory=StopLineDetectorConfig)
@@ -163,6 +167,14 @@ class WorkerConfig:
     moving_speed_threshold: float = 0.25
     """Speed (m/s) above which the agent is considered moving. Used
     for COMMITTED -> EXITED transition hysteresis."""
+
+    # Planar path planner (intersection traversal reference)
+
+    plan_exit_ahead_m: float = 1.5
+    """How far past the exit-road entry to extend the final plan
+    waypoint, in meters. ~1-2 F1TENTH car lengths. Gives downstream
+    reward shaping / scheduler overlap detection a runway past the
+    intersection box on the exit road."""
 
 
 class WorkerNode:
@@ -255,6 +267,16 @@ class WorkerNode:
         self._last_detection: StopLineDetection = StopLineDetection()
         self._warned_missing_image: bool = False
 
+        # Planar path planner (intersection traversal reference)
+        # Generates a world-frame PlanarPath for each traversal. The
+        # plan is stored on this Worker and exposed via
+        # AgentNode.current_plan; it never enters the policy's
+        # observation vector (PVP).
+        self._path_planner = PlanarPathPlanner(
+            exit_plan_ahead_m=self.config.plan_exit_ahead_m,
+        )
+        self._current_plan: Optional[PlanarPath] = None
+
     @property
     def turn_token(self) -> int:
         """Current turn command for the policy."""
@@ -303,6 +325,13 @@ class WorkerNode:
     def current_approach_road_id(self) -> Optional[str]:
         """Road the agent is on inside the current DECIDING/COMMITTED cycle."""
         return self._current_approach_road_id
+
+    @property
+    def current_plan(self) -> Optional[PlanarPath]:
+        """Active planar reference path through the current intersection,
+        or None when CRUISING / between traversals. Not observable by
+        the policy (PVP)."""
+        return self._current_plan
 
     def step(
         self,
@@ -507,6 +536,22 @@ class WorkerNode:
             self._committed_exit_road_id = approach_info.exits[self._turn_token].exit_road_id
         else:
             self._committed_exit_road_id = None
+
+        # Generate the planar reference path for this traversal.
+        # Stored on the Worker and exposed via AgentNode.current_plan.
+        # Privileged: uses ground-truth position + topology, never
+        # enters the observation vector. None is allowed — downstream
+        # consumers (info dict, scheduler, future reward shaping)
+        # must tolerate absent plans.
+        self._current_plan = self._path_planner.plan(
+            current_xy=position,
+            current_heading=heading,
+            intersection=intersection,
+            entry_road_id=road_id,
+            exit_road_id=self._committed_exit_road_id,
+            turn_command=self._turn_token,
+            layout=self.config.layout,
+        )
 
         # During APPROACHING we override go_signal to 0 regardless of
         # scheduler, so the brake override kicks in.
@@ -815,6 +860,9 @@ class WorkerNode:
         self._last_detection = StopLineDetection()
         self._warned_missing_image = False
 
+        # Planar path planner state
+        self._current_plan = None
+
         # NOTE: _route_index and _total_steps persist across episodes
         # NOTE: _detector instance is intentionally NOT reset — it's
         # stateless across frames, no per-episode cleanup needed
@@ -1058,9 +1106,21 @@ class AgentNode:
         self._last_go_signal = 1.0
 
     @property
+    def current_plan(self):
+        """Active planar reference path for this agent's current
+        intersection traversal, or None when CRUISING.
+
+        Exposed on AgentNode so the scheduler, reward wrapper, and
+        future MARL coordination can read plans from every agent
+        without reaching into WorkerNode internals. NOT in the
+        observation vector (PVP)."""
+        return self.worker.current_plan
+
+    @property
     def info(self) -> Dict:
         """Current agent state for logging."""
         det = self.worker.last_detection
+        plan = self.worker.current_plan
         return {
             "agent_id": self.agent_id,
             "worker_state": self.worker.state,
@@ -1079,4 +1139,10 @@ class AgentNode:
             "exited_road": self.worker.exited_road_id,
             "exit_correct": self.worker.exit_correct,
             "approach_road": self.worker.current_approach_road_id,
+            # Planar path plan (non-privileged; for logging and future
+            # reward shaping / scheduler overlap detection only — NOT
+            # exposed in the observation vector).
+            "plan_present": plan is not None,
+            "plan_num_waypoints": plan.num_waypoints if plan is not None else 0,
+            "plan_length_m": float(plan.length) if plan is not None else 0.0,
         }

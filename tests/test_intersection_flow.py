@@ -23,6 +23,7 @@ Run:
 
 Author: Aaron Hamil
 Date: 04/20/26
+Updated: 04/23/26
 """
 
 from __future__ import annotations
@@ -837,6 +838,210 @@ class TestFullStack:
         assert final_info["exited_road"] == "road_B", \
             f"expected exit on road_B, got {final_info['exited_road']}"
         assert final_info["exit_correct"] is True
+
+
+# Planar Path Planner
+
+class TestPlanarPathPlanner:
+    """
+    Geometric unit tests for the Worker-side 2D trajectory planner.
+
+    These test the planner class in isolation — no WorkerNode, no
+    scheduler, no env. Integration of the planner with the Worker's
+    state machine is covered by TestPlanViaWorker below.
+    """
+
+    def test_straight_plan_stays_in_right_lane(self, cross_graph, default_layout):
+        """STRAIGHT traversal: all waypoints after wp0 sit in the
+        right lane of the entry/exit axis (no centerline zigzag)."""
+        from agent.planar_planner import PlanarPathPlanner
+        planner = PlanarPathPlanner()
+        node = cross_graph.get_intersection("int_main")
+        plan = planner.plan(
+            current_xy=(-1.2, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_D", exit_road_id="road_B",
+            turn_command=TurnCommand.STRAIGHT, layout=default_layout,
+        )
+        assert plan is not None
+        assert plan.num_waypoints == 5
+        # Right lane on D->B axis sits at y = -lane_half_width.
+        lane_y = -default_layout.lane_half_width
+        for wp in plan.waypoints[1:]:
+            assert abs(wp.y - lane_y) < 1e-6, \
+                f"waypoint off right lane: y={wp.y}, expected {lane_y}"
+        # And the plan heads east throughout.
+        for wp in plan.waypoints[1:]:
+            assert abs(wp.heading - 0.0) < 1e-6
+
+    def test_right_turn_plan_ends_on_correct_road(self, cross_graph, default_layout):
+        """RIGHT from road_D points to road_A in the fixture; the plan's
+        final waypoint should sit on road_A in the north-driving lane."""
+        from agent.planar_planner import PlanarPathPlanner
+        planner = PlanarPathPlanner()
+        node = cross_graph.get_intersection("int_main")
+        plan = planner.plan(
+            current_xy=(-1.2, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_D", exit_road_id="road_A",
+            turn_command=TurnCommand.RIGHT, layout=default_layout,
+        )
+        assert plan is not None
+        # road_A approach heading = 270deg (south-facing to center).
+        # Exit driving heading = +90deg (north, AWAY from center).
+        # Final waypoint's heading should match the exit driving direction.
+        import math as _m
+        final = plan.waypoints[-1]
+        assert abs(_m.degrees(final.heading) - 90.0) < 1e-3
+
+    def test_left_turn_plan_ends_on_correct_road(self, cross_graph, default_layout):
+        """LEFT from road_D points to road_C in the fixture."""
+        from agent.planar_planner import PlanarPathPlanner
+        planner = PlanarPathPlanner()
+        node = cross_graph.get_intersection("int_main")
+        plan = planner.plan(
+            current_xy=(-1.2, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_D", exit_road_id="road_C",
+            turn_command=TurnCommand.LEFT, layout=default_layout,
+        )
+        assert plan is not None
+        # road_C approach heading = 90deg; exit driving heading = 270deg
+        # (south); wrapped to (-pi, pi] that's -90deg.
+        import math as _m
+        final = plan.waypoints[-1]
+        assert abs(_m.degrees(final.heading) - (-90.0)) < 1e-3
+
+    def test_plan_rejects_past_center_vehicle(self, cross_graph, default_layout):
+        """If the agent is already past the intersection center on the
+        entry road, the planner should refuse to build a plan."""
+        from agent.planar_planner import PlanarPathPlanner
+        planner = PlanarPathPlanner()
+        node = cross_graph.get_intersection("int_main")
+        plan = planner.plan(
+            current_xy=(+1.0, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_D", exit_road_id="road_B",
+            turn_command=TurnCommand.STRAIGHT, layout=default_layout,
+        )
+        assert plan is None
+
+    def test_plan_rejects_missing_exit_road(self, cross_graph, default_layout):
+        """No committed exit road -> no plan."""
+        from agent.planar_planner import PlanarPathPlanner
+        planner = PlanarPathPlanner()
+        node = cross_graph.get_intersection("int_main")
+        plan = planner.plan(
+            current_xy=(-1.2, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_D", exit_road_id=None,
+            turn_command=TurnCommand.STRAIGHT, layout=default_layout,
+        )
+        assert plan is None
+
+    def test_plan_rejects_uncalibrated_node(self, default_layout):
+        """An intersection without a calibrated position -> no plan."""
+        from agent.planar_planner import PlanarPathPlanner
+        approaches = {
+            "road_X": ApproachInfo(
+                road_id="road_X", heading_rad=0.0,
+                exits={TurnCommand.STRAIGHT: ExitOption(TurnCommand.STRAIGHT, "road_Y")},
+            ),
+            "road_Y": ApproachInfo(
+                road_id="road_Y", heading_rad=math.pi,
+                exits={},
+            ),
+        }
+        node = IntersectionNode(node_id="uncal", approaches=approaches, position=None)
+        plan = PlanarPathPlanner().plan(
+            current_xy=(-1.0, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_X", exit_road_id="road_Y",
+            turn_command=TurnCommand.STRAIGHT, layout=default_layout,
+        )
+        assert plan is None
+
+    def test_cross_track_distance_zero_on_path(self, cross_graph, default_layout):
+        """A point exactly on a plan segment has cross-track ~= 0."""
+        from agent.planar_planner import PlanarPathPlanner
+        planner = PlanarPathPlanner()
+        node = cross_graph.get_intersection("int_main")
+        plan = planner.plan(
+            current_xy=(-1.2, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_D", exit_road_id="road_B",
+            turn_command=TurnCommand.STRAIGHT, layout=default_layout,
+        )
+        # Point lying on the right-lane segment inside the intersection:
+        # at (0.0, -0.25), should be on wp2->wp3.
+        assert plan.cross_track_distance((0.0, -0.25)) < 1e-6
+        # Off-lane by 0.1m -> ~0.1m cross track.
+        assert abs(plan.cross_track_distance((0.0, -0.15)) - 0.1) < 1e-6
+
+    def test_plan_arc_length_monotone(self, cross_graph, default_layout):
+        """Cumulative s is monotone non-decreasing across the plan."""
+        from agent.planar_planner import PlanarPathPlanner
+        planner = PlanarPathPlanner()
+        node = cross_graph.get_intersection("int_main")
+        plan = planner.plan(
+            current_xy=(-1.2, 0.0), current_heading=0.0,
+            intersection=node,
+            entry_road_id="road_D", exit_road_id="road_B",
+            turn_command=TurnCommand.STRAIGHT, layout=default_layout,
+        )
+        assert plan.waypoints[0].s == 0.0
+        for i in range(1, plan.num_waypoints):
+            assert plan.waypoints[i].s >= plan.waypoints[i - 1].s
+
+
+class TestPlanViaWorker:
+    """
+    End-to-end: the Worker should produce a current_plan when it
+    promotes CRUISING -> DECIDING, and the plan should survive through
+    COMMITTED -> EXITED until the NEXT CRUISING cycle.
+    """
+
+    def test_worker_produces_plan_on_pre_gate(self, cross_graph, default_layout):
+        worker = WorkerNode(
+            agent_id="a0",
+            graph=cross_graph,
+            config=WorkerConfig(
+                use_stop_line=True, detector_kind="geometric",
+                layout=default_layout,
+                mode="route", route=[TurnCommand.STRAIGHT],
+            ),
+        )
+        # Initially no plan.
+        assert worker.current_plan is None
+        # Step into pre-gate: D approach, within 1.5m.
+        worker.step(position=(-1.2, 0.0), heading=0.0, speed=1.0, dt=0.05)
+        assert worker.state == WorkerNode.DECIDING
+        plan = worker.current_plan
+        assert plan is not None
+        assert plan.entry_road_id == "road_D"
+        # STRAIGHT from D -> B per fixture topology.
+        assert plan.exit_road_id == "road_B"
+        assert plan.num_waypoints == 5
+
+    def test_plan_visible_in_agent_info_dict(self, cross_graph, default_layout):
+        """AgentNode.info should surface plan stats for logging."""
+        from agent.agent_node import AgentNode, AgentConfig
+        agent = AgentNode(
+            graph=cross_graph,
+            config=AgentConfig(
+                agent_id="a0",
+                worker=WorkerConfig(
+                    use_stop_line=True, detector_kind="geometric",
+                    layout=default_layout,
+                    mode="route", route=[TurnCommand.STRAIGHT],
+                ),
+            ),
+        )
+        agent.worker_step(position=(-1.2, 0.0), heading=0.0, speed=1.0, dt=0.05)
+        info = agent.info
+        assert info["plan_present"] is True
+        assert info["plan_num_waypoints"] == 5
+        assert info["plan_length_m"] > 0.0
 
 
 # Standalone runner

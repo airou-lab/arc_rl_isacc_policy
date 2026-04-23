@@ -11,7 +11,7 @@ Replaces the old hardcoded set_turn_bias() pattern with graph-based
 route planning and multi-agent intersection coordination.
 
 Author: Aaron Hamil
-Date: 03/12/16
+Date: 03/12/26
 Updated: 04/23/26
 """
 
@@ -42,6 +42,11 @@ from agent.geometry_calibrator import (
     GeometryCalibrator,
     CalibrationConfig,
 )
+from agent.planar_planner import (
+    PlanarPathPlanner,
+    PlanarPath,
+    PlanarWaypoint,
+)
 
 __all__ = [
     "AgentNode",
@@ -59,6 +64,9 @@ __all__ = [
     "AgentEnvWrapper",
     "GeometryCalibrator",
     "CalibrationConfig",
+    "PlanarPathPlanner",
+    "PlanarPath",
+    "PlanarWaypoint",
     "IDX_TURN_TOKEN",
     "IDX_GO_SIGNAL",
 ]
