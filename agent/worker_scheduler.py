@@ -1,54 +1,62 @@
 """
 Worker Scheduler — Multi-Agent Intersection Coordination
-========================================================
 
 Sits outside all AgentNodes and coordinates their Workers at shared
 intersections. Each Worker registers its intended turn with the
 Scheduler before executing, and the Scheduler returns a go/wait
-signal based on conflict analysis and RVO velocity constraints.
+signal based on conflict analysis and time-gap reservation.
 
 Architecture:
-    WorkerScheduler (one per simulation)
+    WorkerScheduler (one per simulation, in-process for now)
     ├── Maintains an intent registry: {agent_id -> IntentRecord}
     ├── Detects conflicts: overlapping paths through intersection
-    ├── Computes RVO velocity constraints for trajectory spacing
+    ├── Computes occupancy intervals at the crossing center
     └── Returns go_signal in {0.0, 1.0} per agent per step
 
 Conflict Detection:
     Two agents conflict if they're at the same intersection AND their
-    intended paths cross. The conflict matrix is defined per intersection
-    in the graph JSON (or computed from exit headings).
+    intended paths cross. Path-pair conflict is determined from
+    relative approach headings and turn commands (_paths_conflict).
 
-    Simple version (Phase 1): Priority by arrival order. First agent to
-    register at an intersection gets GO, later agents get WAIT until
-    the first clears.
+Time-Gap Reservation (replaces the previous buggy RVO sketch):
+    Each agent's distance to the calibrated intersection CENTER is
+    used to compute an occupancy interval [enter, exit] at the
+    crossing zone. The crossing zone is a disk of radius
+    `crossing_radius_m` around the intersection center.
 
-    RVO version (Phase 2): Agents approaching with conflicting paths
-    receive velocity constraints that keep their trajectories separated
-    by a minimum time gap.
+    A lower-priority agent B is blocked by a higher-priority agent A
+    when A and B's paths conflict AND
+        agent_enter_B < other_exit_A + time_gap_seconds
 
-Reciprocal Velocity Obstacles (RVO):
-    Standard RVO computes a velocity-space constraint for each agent
-    pair such that, if both agents respect their half of the avoidance,
-    collision is guaranteed impossible. For intersection coordination:
+    If A is already COMMITTED (mid-traversal), A's window is treated
+    as starting at now, so B waits for A to fully clear plus margin.
 
-    - We compute the time-to-intersection (TTI) for each agent
-    - If two agents' TTIs overlap within a safety margin, the later
-      one receives go_signal = 0 (WAIT)
-    - The safety margin accounts for vehicle length, braking distance,
-      and sim-to-real timing jitter
+    When the graph passed in at construction has no calibrated
+    position for the intersection, the scheduler falls back to a
+    conservative block on any path conflict — same effective behavior
+    as the legacy single-agent fixture tests.
 
-    This is simpler than full continuous RVO because intersections have
-    discrete conflict points (the crossing zone), not continuous
-    obstacle boundaries. We only need to ensure temporal separation
-    at the crossing, not spatial avoidance along arbitrary paths.
+Phase Field on IntentRecord:
+    DECIDING  — registered, awaiting clearance
+    COMMITTED — released by scheduler, traversing
+    CLEARING  — about to leave (currently unused; kept for future
+                hand-off semantics with a remote IntersectionNodeServer)
+
+    Phase advances inside _compute_go_signal the moment the agent
+    is granted go=1.0. The Worker does not read or write phase.
+
+Single-process default:
+    The Worker still calls register_intent / query_go_signal /
+    clear_agent directly on this object. The class-level interface is
+    what a future SchedulerTransport (gz-transport / ROS2) will adapt.
 
 Dependencies:
     - numpy
-    - agent/intersection_graph.py (TurnCommand)
+    - agent/intersection_graph.py (TurnCommand, IntersectionGraph)
 
 Author: Aaron Hamil
 Date: 03/12/26
+Updated: 04/25/26  — TTI uses crossing-center distance; IntentPhase added
 """
 
 from __future__ import annotations
@@ -56,13 +64,33 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
 
 from agent.intersection_graph import TurnCommand
 
+if TYPE_CHECKING:
+    # Avoid a hard import cycle at runtime; only used for type hints.
+    from agent.intersection_graph import IntersectionGraph
+
 logger = logging.getLogger(__name__)
+
+
+# Phase Constants
+
+class IntentPhase:
+    """
+    Lifecycle of a registered intent inside the scheduler.
+
+    Mirrors the string-style state constants used elsewhere in the
+    codebase (WorkerNode.CRUISING, etc.) rather than enum.Enum, so
+    serialization to a future remote IntersectionNodeServer is just
+    plain JSON strings.
+    """
+    DECIDING = "deciding"     # Registered, awaiting clearance
+    COMMITTED = "committed"   # Released by scheduler, traversing
+    CLEARING = "clearing"     # About to leave (reserved for remote node)
 
 
 # Conflict Rules
@@ -71,15 +99,11 @@ logger = logging.getLogger(__name__)
 # Two agents conflict if their paths through the intersection cross.
 # This is conservative: if in doubt, mark as conflicting.
 #
-# Key: (approach_A_relative, turn_A, approach_B_relative, turn_B) -> bool
-# "approach_X_relative" is the relative direction the other agent comes
-# from (opposite, left, right). Same-direction approaches never conflict
-# because agents are in the same lane.
-#
-# Rather than enumerate all combinations, we use a simpler rule:
+# Rule:
 # Two agents at the same intersection conflict UNLESS they are:
-#   1. Both going straight from opposite directions (no crossing)
-#   2. Both turning right (paths don't cross in right-hand traffic)
+#   1. Following each other from the same direction (no crossing)
+#   2. Both going straight from opposite directions (no crossing)
+#   3. Both turning right (paths don't cross in right-hand traffic)
 #
 # Everything else is conservatively treated as conflicting.
 
@@ -100,7 +124,6 @@ def _paths_conflict(
     Returns:
         True if paths are potentially conflicting (conservative).
     """
-    # Heading difference determines relative approach
     hdg_diff = abs(_angle_diff(heading_a, heading_b))
 
     # Same direction (< 45deg): following each other, no conflict
@@ -115,7 +138,6 @@ def _paths_conflict(
         # Both right from opposite = no conflict (paths don't cross)
         if turn_a == TurnCommand.RIGHT and turn_b == TurnCommand.RIGHT:
             return False
-        # All other opposite combos conflict
         return True
 
     # Perpendicular approaches (45deg-135deg): almost always conflict
@@ -134,31 +156,53 @@ class IntentRecord:
     agent_id: str
     intersection_id: str
     turn_command: int
-    heading: float           # Approach heading (radians)
+    heading: float                          # Approach heading (radians)
     position: Tuple[float, float]
     speed: float
-    registered_at: float     # Timestamp of registration
-    cleared: bool = False    # True once agent leaves intersection
+    registered_at: float                    # Timestamp of registration
+    phase: str = IntentPhase.DECIDING       # Lifecycle phase (see IntentPhase)
+    cleared: bool = False                   # True once agent leaves intersection
 
 
 @dataclass
 class RVOConstraint:
-    """Velocity constraint from RVO computation."""
+    """
+    Velocity constraint from time-gap analysis.
+
+    Kept for forward compatibility with a future continuous-velocity
+    extension; not consumed by the current go/wait API.
+    """
     agent_id: str
-    max_speed: float         # Speed limit to maintain time separation
-    wait: bool               # If True, agent should stop entirely
+    max_speed: float
+    wait: bool
 
 
-# Scheduler
+# Scheduler Configuration
 
 @dataclass
 class SchedulerConfig:
     """Configuration for the WorkerScheduler."""
-    time_gap_seconds: float = 1.5        # Minimum time between agents at crossing
+    time_gap_seconds: float = 1.5        # Minimum gap between crossings
     intent_timeout: float = 15.0         # Stale intent auto-expires (seconds)
     vehicle_length: float = 0.33         # F1Tenth wheelbase (meters)
     safety_margin: float = 0.5           # Extra distance margin (meters)
 
+    # Time-gap arbitration parameters
+    min_speed_for_tti: float = 0.1
+    """Floor on speed used in TTI calculation (m/s). Prevents division
+    by zero when an agent is stopped at the line. With v_min = 0.1
+    m/s and a 0.5 m crossing radius, a stopped agent's "exit time"
+    becomes 5 s — which the time_gap_seconds margin then dominates."""
+
+    crossing_radius_m: float = 0.5
+    """Radius around the intersection center used to define the
+    occupancy zone. An agent is considered to "occupy" the crossing
+    while it's within this radius. F1TENTH crossings on the current
+    USD scene are roughly 0.5 m on each side, so 0.5 m is a sensible
+    starting value."""
+
+
+# Scheduler
 
 class WorkerScheduler:
     """
@@ -169,7 +213,7 @@ class WorkerScheduler:
     prevent path conflicts.
 
     Usage:
-        scheduler = WorkerScheduler()
+        scheduler = WorkerScheduler(graph=graph)
 
         # Workers call these during their step:
         go = scheduler.register_intent(agent_id, intersection_id, turn_cmd)
@@ -182,10 +226,23 @@ class WorkerScheduler:
         scheduler.tick()
     """
 
-    def __init__(self, config: Optional[SchedulerConfig] = None):
+    def __init__(
+        self,
+        config: Optional[SchedulerConfig] = None,
+        graph: Optional["IntersectionGraph"] = None,
+    ):
+        """
+        Args:
+            config: Scheduler configuration. Defaults to SchedulerConfig().
+            graph: Optional IntersectionGraph for crossing-center lookups.
+                If None, the scheduler conservatively blocks on any
+                path conflict (preserves legacy single-process behavior
+                used in the existing test fixtures).
+        """
         self.config = config or SchedulerConfig()
-        self._intents: Dict[str, IntentRecord] = {}  # agent_id -> IntentRecord
-        self._priority_order: Dict[str, List[str]] = {}  # intersection_id -> [agent_ids by arrival]
+        self._graph = graph
+        self._intents: Dict[str, IntentRecord] = {}
+        self._priority_order: Dict[str, List[str]] = {}
 
     def register_intent(
         self,
@@ -214,6 +271,7 @@ class WorkerScheduler:
             position=position,
             speed=speed,
             registered_at=now,
+            phase=IntentPhase.DECIDING,
         )
 
         # Add to priority queue (arrival order)
@@ -238,13 +296,13 @@ class WorkerScheduler:
         """
         Query whether an agent can proceed.
 
-        Called every step while the agent is inside an intersection.
-        Updates the agent's position/speed for RVO computation.
+        Called every step while the agent is inside or approaching an
+        intersection. Updates the agent's position/speed for the
+        time-gap calculation.
 
         Returns:
             1.0 = GO, 0.0 = WAIT.
         """
-        # Update position for RVO
         intent = self._intents.get(agent_id)
         if intent is not None:
             intent.position = position
@@ -279,7 +337,7 @@ class WorkerScheduler:
             if (now - intent.registered_at) > self.config.intent_timeout
         ]
         for aid in expired:
-            logger.debug(f"Scheduler: expired stale intent for {aid}")
+            logger.debug("Scheduler: expired stale intent for %s", aid)
             self.clear_agent(aid)
 
     def _compute_go_signal(
@@ -288,11 +346,12 @@ class WorkerScheduler:
         """
         Determine if agent can proceed based on conflict analysis.
 
-        Phase 1: Priority by arrival order with conflict checking.
-        If the agent has the highest priority among conflicting agents
-        at this intersection, it gets GO. Otherwise WAIT.
+        Priority by arrival order. The agent at the head of the queue
+        always gets GO. For agents behind the head, a path-conflict
+        check followed by a time-gap check decides GO vs WAIT against
+        every higher-priority agent at the same intersection.
 
-        Phase 2 (RVO): Additionally check time-to-intersection overlap.
+        Phase advances to COMMITTED on the tick that returns GO.
         """
         my_intent = self._intents.get(agent_id)
         if my_intent is None:
@@ -300,9 +359,11 @@ class WorkerScheduler:
 
         queue = self._priority_order.get(intersection_id, [])
         if not queue or queue[0] == agent_id:
-            return 1.0  # First in line or no queue = go
+            # First in line (or no queue) — release immediately
+            my_intent.phase = IntentPhase.COMMITTED
+            return 1.0
 
-        # Check if any higher-priority agent has a conflicting path
+        # Check every higher-priority agent for a conflict
         for higher_id in queue:
             if higher_id == agent_id:
                 break  # Reached ourselves in priority order
@@ -315,49 +376,79 @@ class WorkerScheduler:
             if other_intent.cleared:
                 continue
 
-            # Check path conflict
             if _paths_conflict(
                 my_intent.turn_command, my_intent.heading,
                 other_intent.turn_command, other_intent.heading,
             ):
-                # RVO time-gap check
-                if self._rvo_time_gap_violated(my_intent, other_intent):
+                if self._time_gap_violated(my_intent, other_intent):
                     return 0.0  # WAIT — conflict with higher priority
 
-        return 1.0  # No conflicts = GO
+        # No blocking conflicts — release and advance phase
+        my_intent.phase = IntentPhase.COMMITTED
+        return 1.0
 
-    def _rvo_time_gap_violated(
+    def _time_gap_violated(
         self, agent: IntentRecord, other: IntentRecord
     ) -> bool:
         """
-        Check if the time gap between two agents is too small.
+        Check whether `agent` should wait for `other` to clear.
 
-        Simple RVO: estimate time-to-crossing for both agents.
-        If the gap is less than config.time_gap_seconds, the later
-        agent should wait.
+        Computes both agents' occupancy intervals at the calibrated
+        intersection crossing. Blocks `agent` if its arrival would
+        precede `other`'s clearance plus a configurable safety margin.
 
-        For F1Tenth scale (0.33m wheelbase, ~2m/s max), the crossing
-        zone is roughly 0.5m x 0.5m. Time to cross ~= 0.25s at speed.
-        We want at least time_gap_seconds between exits.
+        If `other` is already in the COMMITTED phase, its window is
+        treated as starting at now (it is already inside the
+        crossing), so `agent` waits for `other` to fully clear.
+
+        Without a calibrated graph, falls back to a conservative
+        "always block" — this preserves the behavior the previous
+        (buggy) implementation produced for the existing perpendicular
+        path-conflict test fixture.
         """
-        # Distance from agent to intersection center (approximation)
-        # A more precise version would use the actual crossing point
-        # but for Phase 1 this suffices
-        dist_agent = max(0.1, np.sqrt(
-            (agent.position[0] - other.position[0]) ** 2 +
-            (agent.position[1] - other.position[1]) ** 2
-        ))
+        center = self._intersection_center(agent.intersection_id)
+        if center is None:
+            # No calibrated geometry available. Caller has already
+            # confirmed a path conflict; without timing we conservatively
+            # block. Matches the legacy single-process test expectation.
+            return True
 
-        speed_agent = max(0.1, agent.speed)
-        speed_other = max(0.1, other.speed)
+        d_agent = _euclid(agent.position, center)
+        d_other = _euclid(other.position, center)
 
-        # Rough time-to-crossing estimates
-        tti_agent = dist_agent / speed_agent
-        tti_other = dist_agent / speed_other  # Same distance approximation
+        v_agent = max(self.config.min_speed_for_tti, agent.speed)
+        v_other = max(self.config.min_speed_for_tti, other.speed)
 
-        time_gap = abs(tti_agent - tti_other)
+        cr = self.config.crossing_radius_m
 
-        return time_gap < self.config.time_gap_seconds
+        # Other's occupancy interval at the crossing
+        if other.phase == IntentPhase.COMMITTED:
+            # Already inside the crossing — assume occupying now
+            other_enter = 0.0
+            other_exit = max(0.0, (d_other + cr) / v_other)
+        else:
+            other_enter = max(0.0, (d_other - cr) / v_other)
+            other_exit = (d_other + cr) / v_other
+
+        # When `agent` would enter the crossing
+        agent_enter = max(0.0, (d_agent - cr) / v_agent)
+
+        # Block if `agent` would arrive before `other` clears (plus margin)
+        return agent_enter < (other_exit + self.config.time_gap_seconds)
+
+    def _intersection_center(
+        self, intersection_id: str
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Return the calibrated (x, y) center of an intersection, or None
+        if no graph is configured or the node is uncalibrated.
+        """
+        if self._graph is None:
+            return None
+        node = self._graph.get_intersection(intersection_id)
+        if node is None or not node.is_calibrated:
+            return None
+        return node.position
 
     @property
     def active_intents(self) -> Dict[str, IntentRecord]:
@@ -367,7 +458,8 @@ class WorkerScheduler:
     def __repr__(self) -> str:
         n = len(self._intents)
         intersections = set(i.intersection_id for i in self._intents.values())
-        return f"WorkerScheduler(active={n}, intersections={intersections})"
+        cal = "calibrated" if self._graph is not None else "no-graph"
+        return f"WorkerScheduler(active={n}, intersections={intersections}, {cal})"
 
 
 # Helpers
@@ -378,3 +470,10 @@ def _angle_diff(a: float, b: float) -> float:
     if d > np.pi:
         d -= 2 * np.pi
     return d
+
+
+def _euclid(p: Tuple[float, float], q: Tuple[float, float]) -> float:
+    """Planar Euclidean distance between two (x, y) tuples."""
+    dx = p[0] - q[0]
+    dy = p[1] - q[1]
+    return float(np.sqrt(dx * dx + dy * dy))
