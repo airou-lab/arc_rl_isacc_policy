@@ -1,3 +1,4 @@
+
 """
 Agent Module — Hierarchical Driver-Worker Architecture
 
@@ -12,7 +13,7 @@ route planning and multi-agent intersection coordination.
 
 Author: Aaron Hamil
 Date: 03/12/26
-Updated: 04/23/26
+Updated: 04/25/26
 """
 
 from agent.agent_node import (
@@ -34,6 +35,8 @@ from agent.intersection_graph import (
 from agent.worker_scheduler import (
     WorkerScheduler,
     SchedulerConfig,
+    IntentPhase,
+    IntentRecord,
 )
 from agent.agent_env_wrapper import AgentEnvWrapper
 # TopologicalEKF / TopologicalState removed — see branch
@@ -61,6 +64,8 @@ __all__ = [
     "EdgeGeometry",
     "WorkerScheduler",
     "SchedulerConfig",
+    "IntentPhase",
+    "IntentRecord",
     "AgentEnvWrapper",
     "GeometryCalibrator",
     "CalibrationConfig",
