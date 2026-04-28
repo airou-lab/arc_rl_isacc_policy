@@ -1,50 +1,41 @@
 """
 Scheduler Transport — Pluggable Backend for WorkerScheduler
 
-NOT FOR `dev` BRANCH. This file is part of the multi-agent
-intersection-node work (see .planning/INTERSECTION_NODE_DESIGN.md)
-and lands on `feature/intersection-node` until the first clean
-single-agent training run completes.
+Lives on `feature/intersection-node` until the multi-agent rollout
+ships. See .planning/INTERSECTION_NODE_DESIGN.md.
+
+Updated 04/28/26 (stage 2 refactor):
+    LocalTransport now wraps SchedulerCore (not WorkerScheduler).
+    The SchedulerCore is the single source of truth for arbitration
+    semantics; WorkerScheduler is now a facade that delegates here.
 
 Purpose
--------
 The Worker calls `register_intent` / `query_go_signal` / `clear_agent`
-on a scheduler-shaped object. Today that object is the in-process
-`WorkerScheduler`. After stage 2 of the rollout, agents instead call
-those methods on a `WorkerScheduler` facade that delegates to a
-`SchedulerTransport`, which moves the call to wherever the actual
-arbiter lives:
+on a WorkerScheduler facade. The facade translates each call into an
+IntentMessage and dispatches it through a SchedulerTransport.
+Implementations:
 
-    LocalTransport      — same-process function call (default; tests)
-    GzTransport         — gz-transport13 RPC over a Gazebo network
-    Ros2Transport       — rclpy service / topic over a ROS2 graph
-
-The Worker's API does not change. Only the wiring changes.
+    LocalTransport      — wraps a SchedulerCore in-process (default; tests)
+    GzTransport         — gz-transport13 RPC (stub; stage 3)
+    Ros2Transport       — rclpy service / topic (stub; stage 5)
 
 Wire format
------------
-`IntentMessage` and `ClearanceReply` are JSON-serializable dataclasses
-that match the existing `IntentRecord` / scheduler return type. The
-same payloads flow through every transport.
-
-Status
-------
-- LocalTransport: implemented, wraps `WorkerScheduler`.
-- GzTransport: stub, raises NotImplementedError. Implement at stage 3.
-- Ros2Transport: stub, raises NotImplementedError. Implement at stage 5.
+IntentMessage and ClearanceReply are JSON-serializable dataclasses
+that match the SchedulerCore's IntentRecord / return type. The same
+payloads flow through every transport.
 
 Author: Aaron Hamil
-Date: 04/25/26
+Date: 04/28/26
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, List, Tuple
 
 if TYPE_CHECKING:
-    from agent.worker_scheduler import WorkerScheduler
+    from agent.scheduler_core import SchedulerCore
 
 
 # Wire format
@@ -55,8 +46,8 @@ class IntentMessage:
     JSON-serializable intent payload exchanged between agents and the
     intersection node server.
 
-    Mirrors the fields of WorkerScheduler.IntentRecord exactly so
-    the server can deserialize directly into its registry.
+    Mirrors the fields of SchedulerCore.IntentRecord exactly so the
+    server can deserialize directly into its registry.
     """
     agent_id: str
     intersection_id: str
@@ -65,7 +56,7 @@ class IntentMessage:
     heading: float                            # radians
     speed: float                              # m/s
     phase: str = "deciding"                   # IntentPhase string
-    sent_at_monotonic: float = 0.0            # client clock at send
+    sent_at_monotonic: float = 0.0
 
 
 @dataclass
@@ -76,7 +67,7 @@ class ClearanceReply:
     `suggested_retry_s` is informational; the Worker still polls every
     tick. Provided so future versions can implement smarter back-off.
     """
-    go_signal: float = 1.0                    # 1.0 = GO, 0.0 = WAIT
+    go_signal: float = 1.0
     suggested_retry_s: float = 0.0
     server_time: float = 0.0
 
@@ -86,50 +77,51 @@ class ClearanceReply:
 class SchedulerTransport(ABC):
     """
     Pluggable transport between the Worker-side scheduler facade and
-    the IntersectionNodeServer.
+    the arbiter (in-process SchedulerCore or a remote server).
 
     Implementations are expected to be **synchronous** from the
-    Worker's perspective. If the underlying mechanism is async,
-    the implementation must wait for the reply (with a configurable
-    timeout) before returning.
+    Worker's perspective. Async backends must wait for a reply (with
+    a configurable timeout) before returning.
     """
 
     @abstractmethod
     def send_intent(self, msg: IntentMessage) -> ClearanceReply:
-        """Submit an intent and return the server's clearance reply."""
+        """Submit an intent and return the arbiter's clearance reply."""
 
     @abstractmethod
     def clear(self, agent_id: str) -> None:
-        """Tell the server an agent has left the intersection."""
+        """Tell the arbiter an agent has left the intersection."""
 
     @abstractmethod
     def tick(self) -> None:
-        """
-        Per-step housekeeping. For network transports, drain any
-        pending replies and prune stale state.
-        """
+        """Per-step housekeeping. Drains pending replies for net transports."""
 
 
-# In-process adapter (current behavior)
+# In-process adapter
 
 class LocalTransport(SchedulerTransport):
     """
-    Same-process transport. Used when there is no need for a network
-    boundary, e.g. single-process training and unit tests.
+    Same-process transport. Wraps a SchedulerCore directly.
 
-    Wraps an existing `WorkerScheduler` instance and translates each
-    transport call into the corresponding scheduler method. The
-    scheduler does its own arbitration and the reply is constructed
-    from its return value.
+    Used by:
+        - The default WorkerScheduler() construction (single-process
+          training, every existing test).
+        - Unit tests that want to exercise the wire format without a
+          network round-trip.
+
+    Exposes the wrapped core as `self.core` so the facade can offer
+    `active_intents` without going through a query message.
     """
 
-    def __init__(self, scheduler: "WorkerScheduler"):
-        self._sched = scheduler
+    def __init__(self, core: "SchedulerCore"):
+        self.core = core
 
     def send_intent(self, msg: IntentMessage) -> ClearanceReply:
-        # Delegate to the in-process scheduler. The scheduler upserts
-        # the intent and recomputes go_signal in one call.
-        go = self._sched.register_intent(
+        # Delegate to the in-process core. The core upserts the intent
+        # and recomputes go_signal in one call (register_intent and
+        # query_go_signal share the same arbitration path; the only
+        # difference is whether the record exists yet).
+        go = self.core.register_intent(
             agent_id=msg.agent_id,
             intersection_id=msg.intersection_id,
             turn_command=msg.turn_command,
@@ -140,31 +132,30 @@ class LocalTransport(SchedulerTransport):
         return ClearanceReply(go_signal=float(go))
 
     def clear(self, agent_id: str) -> None:
-        self._sched.clear_agent(agent_id)
+        self.core.clear_agent(agent_id)
 
     def tick(self) -> None:
-        self._sched.tick()
+        self.core.tick()
 
 
-# Gazebo / gz-transport13 (multi-agent training)
+# Gazebo / gz-transport13 (stage 3)
 
 class GzTransport(SchedulerTransport):
     """
-    gz-transport13 client transport.
+    gz-transport13 client transport. Stub.
 
     Topic schema (per intersection_id `iid`):
         /arcpro/intersection/<iid>/intent              (pub from agent)
         /arcpro/intersection/<iid>/clearance/<agent>   (pub from server)
         /arcpro/intersection/<iid>/clear               (pub from agent on exit)
 
-    Implementation deferred to stage 3 of the rollout. Constructing
-    this transport raises NotImplementedError so accidental wiring
-    fails loudly rather than degrading silently.
+    Implementation deferred to stage 3. Constructing this transport
+    raises NotImplementedError so accidental wiring fails loudly.
     """
 
     def __init__(
         self,
-        intersection_ids: list[str],
+        intersection_ids: List[str],
         timeout_ms: int = 50,
         retry_count: int = 1,
     ):
@@ -183,15 +174,14 @@ class GzTransport(SchedulerTransport):
         raise NotImplementedError
 
 
-# ROS2 / rclpy (deployment)
+# ROS2 / rclpy (stage 5)
 
 class Ros2Transport(SchedulerTransport):
     """
-    ROS2 client transport for hardware deployment.
+    ROS2 client transport for hardware deployment. Stub.
 
-    Same topic schema as GzTransport, but backed by rclpy. Brought
-    online once GzTransport works in simulation and the first
-    multi-NUC physical run is queued.
+    Same topic schema as GzTransport, backed by rclpy. Implemented at
+    stage 5 once GzTransport is stable in simulation.
     """
 
     def __init__(

@@ -1,4 +1,3 @@
-
 """
 Agent Module — Hierarchical Driver-Worker Architecture
 
@@ -6,14 +5,15 @@ Each vehicle is managed by an AgentNode containing:
     - Worker node: route planning via intersection graph
     - Main node: vehicle control via learned policy
 
-External coordination via WorkerScheduler.
+External coordination via WorkerScheduler (facade) backed by a
+SchedulerCore (in-process arbiter) or a remote intersection node
+server (network arbiter).
 
 Replaces the old hardcoded set_turn_bias() pattern with graph-based
 route planning and multi-agent intersection coordination.
 
 Author: Aaron Hamil
-Date: 03/12/26
-Updated: 04/25/26
+Updated: 04/28/26  — SchedulerCore + WorkerScheduler facade refactor
 """
 
 from agent.agent_node import (
@@ -32,12 +32,13 @@ from agent.intersection_graph import (
     ExitOption,
     EdgeGeometry,
 )
-from agent.worker_scheduler import (
-    WorkerScheduler,
+from agent.scheduler_core import (
+    SchedulerCore,
     SchedulerConfig,
     IntentPhase,
     IntentRecord,
 )
+from agent.worker_scheduler import WorkerScheduler
 from agent.agent_env_wrapper import AgentEnvWrapper
 # TopologicalEKF / TopologicalState removed — see branch
 # `legacy/frenet-topological` for the shelved deployment-side path.
@@ -62,6 +63,7 @@ __all__ = [
     "TurnCommand",
     "ExitOption",
     "EdgeGeometry",
+    "SchedulerCore",
     "WorkerScheduler",
     "SchedulerConfig",
     "IntentPhase",

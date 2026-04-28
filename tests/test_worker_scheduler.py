@@ -1,25 +1,26 @@
 """
 Worker Scheduler Tests
 
-Pytest coverage for agent/worker_scheduler.py. Mirrors the four legacy
-cases that live in test_all_so_far.py and adds the graph-calibrated
-paths that were uncovered before the time-gap rewrite.
+Pytest coverage for the WorkerScheduler facade and the SchedulerCore
+it delegates to. Mirrors the four legacy cases that live in
+test_all_so_far.py and adds the graph-calibrated paths that were
+uncovered before the time-gap rewrite.
 
-Two layers:
-    1. No-graph cases — exercise the conservative fallback used by
-       legacy single-process fixtures. These match what the previous
-       (buggy) implementation produced for the same inputs and are the
-       behavior every existing caller expects.
-
-    2. Graph-calibrated cases — exercise the rewritten time-gap
-       arbitration with a real IntersectionGraph. These are the tests
-       that would have caught the agent-to-agent-distance bug.
+Layers:
+    1. Path-conflict heuristic — geometry-free first-pass filter.
+    2. No-graph cases — exercise the conservative fallback used by
+       the legacy single-process fixtures.
+    3. Phase transitions — DECIDING -> COMMITTED on the GO tick.
+    4. Graph-calibrated cases — exercise the rewritten time-gap math.
+    5. Stale-intent expiry — tick() GC.
+    6. Facade pluggability — confirm the WorkerScheduler facade
+       accepts a custom transport and routes through it.
 
 Run:
     python -m pytest tests/test_worker_scheduler.py -v
 
 Author: Aaron Hamil
-Date: 04/25/26
+Date: 04/28/26
 """
 
 from __future__ import annotations
@@ -37,6 +38,13 @@ from agent.intersection_graph import (
     IntersectionGraph,
     IntersectionNode,
     TurnCommand,
+)
+from agent.scheduler_core import SchedulerCore
+from agent.scheduler_transport import (
+    ClearanceReply,
+    IntentMessage,
+    LocalTransport,
+    SchedulerTransport,
 )
 from agent.worker_scheduler import (
     IntentPhase,
@@ -84,21 +92,18 @@ class TestPathsConflict:
     """Geometry-free conflict matrix used as the first-pass filter."""
 
     def test_same_direction_no_conflict(self):
-        # Two agents from the same approach following each other
         assert not _paths_conflict(
             TurnCommand.STRAIGHT, 0.0,
             TurnCommand.STRAIGHT, math.radians(10),
         )
 
     def test_opposite_straight_no_conflict(self):
-        # Two agents going straight from opposite directions pass each other
         assert not _paths_conflict(
             TurnCommand.STRAIGHT, 0.0,
             TurnCommand.STRAIGHT, math.radians(180),
         )
 
     def test_opposite_with_left_conflicts(self):
-        # Opposite directions, one turning left -> conflict
         assert _paths_conflict(
             TurnCommand.LEFT, 0.0,
             TurnCommand.STRAIGHT, math.radians(180),
@@ -111,7 +116,6 @@ class TestPathsConflict:
         )
 
     def test_both_right_no_conflict(self):
-        # Right-hand traffic: two right turns don't cross
         assert not _paths_conflict(
             TurnCommand.RIGHT, 0.0,
             TurnCommand.RIGHT, math.radians(90),
@@ -123,7 +127,9 @@ class TestPathsConflict:
 class TestSchedulerNoGraph:
     """
     Replicates the four cases from test_all_so_far.py and pins the
-    "conservative block on conflict, no graph" semantics.
+    "conservative block on conflict, no graph" semantics. The facade
+    builds a default LocalTransport(SchedulerCore()) — these tests
+    therefore exercise both layers end-to-end.
     """
 
     def test_single_agent_gets_go(self):
@@ -182,7 +188,6 @@ class TestIntentPhase:
             "a1", "int_main", TurnCommand.LEFT,
             heading=math.radians(90), speed=1.0, position=(0.0, 1.0),
         )
-        # a1 is blocked -> stays DECIDING; a0 is head of queue -> COMMITTED
         assert sched.active_intents["a0"].phase == IntentPhase.COMMITTED
         assert sched.active_intents["a1"].phase == IntentPhase.DECIDING
 
@@ -191,14 +196,12 @@ class TestIntentPhase:
 
 class TestSchedulerWithGraph:
     """
-    These tests are the ones that would have caught the
-    agent-to-agent-distance bug. They exercise the rewritten
-    occupancy-interval math against a calibrated intersection.
+    These tests would have caught the agent-to-agent-distance bug.
+    They exercise the rewritten occupancy-interval math against a
+    calibrated intersection.
     """
 
     def test_close_perpendicular_blocks(self, calibrated_graph):
-        """Two perpendicular straights, both 1 m from center at 1 m/s.
-        Time-gap exceeds nominal clearance window -> second arrival waits."""
         sched = WorkerScheduler(graph=calibrated_graph)
         sched.register_intent(
             "a0", "int_main", TurnCommand.STRAIGHT,
@@ -211,12 +214,10 @@ class TestSchedulerWithGraph:
         assert go == 0.0
 
     def test_far_slow_second_arrival_clears(self, calibrated_graph):
-        """Second agent so far away that the head will have cleared
-        long before they arrive -> they get GO."""
         sched = WorkerScheduler(graph=calibrated_graph)
         sched.register_intent(
             "a0", "int_main", TurnCommand.STRAIGHT,
-            heading=0.0, position=(-0.3, 0.0), speed=2.0,  # close, fast
+            heading=0.0, position=(-0.3, 0.0), speed=2.0,
         )
         go = sched.register_intent(
             "a1", "int_main", TurnCommand.STRAIGHT,
@@ -225,18 +226,12 @@ class TestSchedulerWithGraph:
         assert go == 1.0
 
     def test_committed_agent_extends_window(self, calibrated_graph):
-        """A COMMITTED head agent has its window stretched to "from now",
-        so a perpendicular newcomer at moderate distance still blocks."""
         sched = WorkerScheduler(graph=calibrated_graph)
-        # a0 registers and is immediately COMMITTED
         sched.register_intent(
             "a0", "int_main", TurnCommand.STRAIGHT,
             heading=0.0, position=(-0.4, 0.0), speed=0.5,
         )
         assert sched.active_intents["a0"].phase == IntentPhase.COMMITTED
-        # a1 perpendicular, 1.5 m away at 1 m/s -> arrives in ~1 s
-        # a0's exit time at center radius = (0.4 + 0.5) / 0.5 = 1.8 s
-        # Margin 1.5 s -> block until 3.3 s; 1 s < 3.3 s -> WAIT
         go = sched.register_intent(
             "a1", "int_main", TurnCommand.STRAIGHT,
             heading=math.radians(90), position=(0.0, -1.5), speed=1.0,
@@ -244,9 +239,6 @@ class TestSchedulerWithGraph:
         assert go == 0.0
 
     def test_uncalibrated_node_falls_back_to_block(self):
-        """A graph whose node has no calibrated position falls back to
-        the conservative no-graph behavior."""
-        # Build a graph without a position
         approaches = {
             "road_W": ApproachInfo(
                 road_id="road_W", heading_rad=0.0,
@@ -289,17 +281,112 @@ class TestSchedulerTick:
         assert "a0" in sched.active_intents
 
     def test_tick_expires_stale_intents(self, monkeypatch):
-        """Patch time.monotonic to force expiry."""
-        import agent.worker_scheduler as ws_mod
+        """
+        Patch time.monotonic on the scheduler_core module — that's
+        where the post-refactor arbitration core calls it from.
+        """
+        import agent.scheduler_core as core_mod
 
         clock = [0.0]
-        monkeypatch.setattr(ws_mod.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(core_mod.time, "monotonic", lambda: clock[0])
 
         sched = WorkerScheduler(SchedulerConfig(intent_timeout=5.0))
         sched.register_intent("a0", "int_main", TurnCommand.STRAIGHT)
-        clock[0] = 10.0  # advance past timeout
+        clock[0] = 10.0
         sched.tick()
         assert "a0" not in sched.active_intents
+
+
+# Layer 6 — Facade pluggability
+
+class _RecordingTransport(SchedulerTransport):
+    """
+    Minimal transport that records every call. Used to confirm that
+    the facade routes through the supplied transport rather than
+    silently building a default.
+    """
+
+    def __init__(self):
+        self.intents_received: list[IntentMessage] = []
+        self.cleared: list[str] = []
+        self.ticks: int = 0
+
+    def send_intent(self, msg: IntentMessage) -> ClearanceReply:
+        self.intents_received.append(msg)
+        return ClearanceReply(go_signal=1.0)
+
+    def clear(self, agent_id: str) -> None:
+        self.cleared.append(agent_id)
+
+    def tick(self) -> None:
+        self.ticks += 1
+
+
+class TestFacadePluggability:
+    """
+    Confirm the WorkerScheduler facade accepts an injected transport
+    and forwards every public-API call through it. This is the only
+    test that exercises the facade-vs-core indirection directly.
+    """
+
+    def test_default_transport_is_local(self):
+        sched = WorkerScheduler()
+        assert isinstance(sched.transport, LocalTransport)
+
+    def test_injected_transport_is_used(self):
+        recorder = _RecordingTransport()
+        sched = WorkerScheduler(transport=recorder)
+        assert sched.transport is recorder
+
+        go = sched.register_intent(
+            "a0", "int_main", TurnCommand.STRAIGHT,
+            position=(1.0, 2.0), heading=3.0, speed=4.0,
+        )
+        assert go == 1.0
+        assert len(recorder.intents_received) == 1
+        msg = recorder.intents_received[0]
+        assert msg.agent_id == "a0"
+        assert msg.intersection_id == "int_main"
+        assert msg.turn_command == TurnCommand.STRAIGHT
+        assert msg.position == (1.0, 2.0)
+        assert msg.heading == 3.0
+        assert msg.speed == 4.0
+        assert msg.phase == IntentPhase.DECIDING
+
+        sched.clear_agent("a0")
+        assert recorder.cleared == ["a0"]
+
+        sched.tick()
+        assert recorder.ticks == 1
+
+    def test_active_intents_unavailable_for_non_local_transport(self):
+        recorder = _RecordingTransport()
+        sched = WorkerScheduler(transport=recorder)
+        with pytest.raises(AttributeError):
+            _ = sched.active_intents
+
+    def test_local_transport_round_trip_via_core(self, calibrated_graph):
+        """
+        Build a SchedulerCore + LocalTransport explicitly and pass to
+        the facade. Behavior should match the default-construction
+        path bit-for-bit.
+        """
+        core = SchedulerCore(graph=calibrated_graph)
+        transport = LocalTransport(core)
+        sched = WorkerScheduler(transport=transport)
+
+        sched.register_intent(
+            "a0", "int_main", TurnCommand.STRAIGHT,
+            heading=0.0, position=(-1.0, 0.0), speed=1.0,
+        )
+        go = sched.register_intent(
+            "a1", "int_main", TurnCommand.STRAIGHT,
+            heading=math.radians(90), position=(0.0, -1.0), speed=1.0,
+        )
+        assert go == 0.0  # same as TestSchedulerWithGraph::test_close_perpendicular_blocks
+        # active_intents returns a fresh dict copy each call, so compare
+        # contents (==), not identity (is).
+        assert sched.active_intents == core.active_intents
 
 
 # Standalone runner
