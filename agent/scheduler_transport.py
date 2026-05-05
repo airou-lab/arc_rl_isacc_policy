@@ -1,8 +1,14 @@
 """
 Scheduler Transport — Pluggable Backend for WorkerScheduler
 
-Lives on `feature/intersection-node` until the multi-agent rollout
-ships. See .planning/INTERSECTION_NODE_DESIGN.md.
+See .planning/INTERSECTION_NODE_DESIGN.md.
+
+Updated 05/04/26 (stage 3 prep):
+    GzTransport removed. The training loop runs in a single Python
+    process inside Isaac Sim, so multi-agent coordination during
+    training is in-process function calls through LocalTransport
+    against one shared IntersectionNodeServer (or a SchedulerCore
+    for single-agent runs). gz-transport13 was never required.
 
 Updated 04/28/26 (stage 2 refactor):
     LocalTransport now wraps SchedulerCore (not WorkerScheduler).
@@ -15,23 +21,29 @@ on a WorkerScheduler facade. The facade translates each call into an
 IntentMessage and dispatches it through a SchedulerTransport.
 Implementations:
 
-    LocalTransport      — wraps a SchedulerCore in-process (default; tests)
-    GzTransport         — gz-transport13 RPC (stub; stage 3)
-    Ros2Transport       — rclpy service / topic (stub; stage 5)
+    LocalTransport      — wraps a SchedulerCore-compatible arbiter
+                          in-process (default; tests; multi-agent
+                          training when wrapping a shared
+                          IntersectionNodeServer)
+    Ros2Transport       — rclpy service / topic (stub; stage 5,
+                          deployment only)
 
 Wire format
 IntentMessage and ClearanceReply are JSON-serializable dataclasses
-that match the SchedulerCore's IntentRecord / return type. The same
-payloads flow through every transport.
+that match the SchedulerCore's IntentRecord / return type. In
+training (LocalTransport) the same dataclasses are passed by
+reference; no serialization actually happens, but constructing an
+IntentMessage is the unified call path so deployment via
+Ros2Transport reuses it without translation.
 
 Author: Aaron Hamil
-Date: 04/28/26
+Date: 04/28/26 (stage 2), updated 05/04/26 (stage 3 prep)
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Tuple
 
 if TYPE_CHECKING:
@@ -77,7 +89,8 @@ class ClearanceReply:
 class SchedulerTransport(ABC):
     """
     Pluggable transport between the Worker-side scheduler facade and
-    the arbiter (in-process SchedulerCore or a remote server).
+    the arbiter (in-process SchedulerCore / IntersectionNodeServer or
+    a remote ROS2 server).
 
     Implementations are expected to be **synchronous** from the
     Worker's perspective. Async backends must wait for a reply (with
@@ -101,15 +114,19 @@ class SchedulerTransport(ABC):
 
 class LocalTransport(SchedulerTransport):
     """
-    Same-process transport. Wraps a SchedulerCore directly.
+    Same-process transport. Wraps a SchedulerCore-compatible arbiter
+    directly. Accepts either:
 
-    Used by:
-        - The default WorkerScheduler() construction (single-process
-          training, every existing test).
-        - Unit tests that want to exercise the wire format without a
-          network round-trip.
+        - SchedulerCore: single-agent training, every existing test.
+        - IntersectionNodeServer: multi-agent training, one shared
+          server instance hands clearance to every agent's
+          WorkerScheduler.
 
-    Exposes the wrapped core as `self.core` so the facade can offer
+    Both expose the same public surface (register_intent /
+    query_go_signal / clear_agent / tick / active_intents), so the
+    transport doesn't care which it's holding.
+
+    Exposes the wrapped arbiter as `self.core` so the facade can offer
     `active_intents` without going through a query message.
     """
 
@@ -138,50 +155,20 @@ class LocalTransport(SchedulerTransport):
         self.core.tick()
 
 
-# Gazebo / gz-transport13 (stage 3)
+# ROS2 / rclpy (stage 5, deployment only)
 
-class GzTransport(SchedulerTransport):
+class Ros2Transport(SchedulerTransport):
     """
-    gz-transport13 client transport. Stub.
+    ROS2 client transport for hardware deployment. Stub.
 
     Topic schema (per intersection_id `iid`):
         /arcpro/intersection/<iid>/intent              (pub from agent)
         /arcpro/intersection/<iid>/clearance/<agent>   (pub from server)
         /arcpro/intersection/<iid>/clear               (pub from agent on exit)
 
-    Implementation deferred to stage 3. Constructing this transport
-    raises NotImplementedError so accidental wiring fails loudly.
-    """
-
-    def __init__(
-        self,
-        intersection_ids: List[str],
-        timeout_ms: int = 50,
-        retry_count: int = 1,
-    ):
-        raise NotImplementedError(
-            "GzTransport: implement at stage 3 of the rollout. See "
-            ".planning/INTERSECTION_NODE_DESIGN.md."
-        )
-
-    def send_intent(self, msg: IntentMessage) -> ClearanceReply:
-        raise NotImplementedError
-
-    def clear(self, agent_id: str) -> None:
-        raise NotImplementedError
-
-    def tick(self) -> None:
-        raise NotImplementedError
-
-
-# ROS2 / rclpy (stage 5)
-
-class Ros2Transport(SchedulerTransport):
-    """
-    ROS2 client transport for hardware deployment. Stub.
-
-    Same topic schema as GzTransport, backed by rclpy. Implemented at
-    stage 5 once GzTransport is stable in simulation.
+    Implementation deferred to stage 5 once stages 3-4 are stable in
+    simulation. Constructing this transport raises NotImplementedError
+    so accidental wiring fails loudly.
     """
 
     def __init__(
@@ -190,7 +177,8 @@ class Ros2Transport(SchedulerTransport):
         timeout_ms: int = 100,
     ):
         raise NotImplementedError(
-            "Ros2Transport: implement at stage 5 of the rollout."
+            "Ros2Transport: implement at stage 5 of the rollout. "
+            "See .planning/INTERSECTION_NODE_DESIGN.md."
         )
 
     def send_intent(self, msg: IntentMessage) -> ClearanceReply:

@@ -6,14 +6,15 @@ Each vehicle is managed by an AgentNode containing:
     - Main node: vehicle control via learned policy
 
 External coordination via WorkerScheduler (facade) backed by a
-SchedulerCore (in-process arbiter) or a remote intersection node
-server (network arbiter).
+SchedulerCore (single-agent in-process arbiter) or a shared
+IntersectionNodeServer (multi-agent in-process arbiter; deploys via
+ROS2 to a per-intersection physical server).
 
 Replaces the old hardcoded set_turn_bias() pattern with graph-based
 route planning and multi-agent intersection coordination.
 
 Author: Aaron Hamil
-Updated: 04/28/26  — SchedulerCore + WorkerScheduler facade refactor
+Updated: 05/04/26  — IntersectionNodeServer (stage 3) added
 """
 
 from agent.agent_node import (
@@ -39,6 +40,7 @@ from agent.scheduler_core import (
     IntentRecord,
 )
 from agent.worker_scheduler import WorkerScheduler
+from agent.intersection_node_server import IntersectionNodeServer
 from agent.agent_env_wrapper import AgentEnvWrapper
 # TopologicalEKF / TopologicalState removed — see branch
 # `legacy/frenet-topological` for the shelved deployment-side path.
@@ -65,6 +67,7 @@ __all__ = [
     "EdgeGeometry",
     "SchedulerCore",
     "WorkerScheduler",
+    "IntersectionNodeServer",
     "SchedulerConfig",
     "IntentPhase",
     "IntentRecord",
