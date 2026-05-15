@@ -12,6 +12,7 @@ Run:
 
 Author: Aaron Hamil
 Date: 03/31/26
+Updated: 05/15/26
 """
 
 import sys
@@ -38,7 +39,7 @@ class MockEnvBase(gym.Env):
         self.config = config
         self.kwargs = kwargs
         self.observation_space = spaces.Dict({
-            "image": spaces.Box(0, 255, shape=(90, 160, 3), dtype=np.uint8),
+            "image": spaces.Box(0, 255, shape=(224, 224, 3), dtype=np.uint8),
             "vec": spaces.Box(-np.inf, np.inf, shape=(12,), dtype=np.float32),
         })
         self.action_space = spaces.Box(
@@ -49,14 +50,14 @@ class MockEnvBase(gym.Env):
 
     def step(self, action):
         obs = {
-            "image": np.zeros((90, 160, 3), dtype=np.uint8),
+            "image": np.zeros((224, 224, 3), dtype=np.uint8),
             "vec": np.zeros(12, dtype=np.float32),
         }
         return obs, 0.0, False, False, {}
 
     def reset(self, seed=None, options=None):
         obs = {
-            "image": np.zeros((90, 160, 3), dtype=np.uint8),
+            "image": np.zeros((224, 224, 3), dtype=np.uint8),
             "vec": np.zeros(12, dtype=np.float32),
         }
         return obs, {}
@@ -200,10 +201,10 @@ class TestCreateEnv:
 
         env = create_env("test_sim")
 
-        # Observation space: Dict with image (90,160,3) and vec (12,)
+        # Observation space: Dict with image (224,224,3) and vec (12,)
         assert "image" in env.observation_space.spaces
         assert "vec" in env.observation_space.spaces
-        assert env.observation_space["image"].shape == (90, 160, 3)
+        assert env.observation_space["image"].shape == (224, 224, 3)
         assert env.observation_space["vec"].shape == (12,)
 
         # Action space: Box(3,) with correct bounds

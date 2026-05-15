@@ -46,8 +46,8 @@ def run_inference(args):
 
     # Environment
     config = IsaacROS2Config(
-        img_width=160,
-        img_height=90,
+        img_width=224,
+        img_height=224,
         camera_topic=args.camera_topic,
         state_topic=args.state_topic,
         control_topic=args.control_topic,

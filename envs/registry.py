@@ -17,7 +17,7 @@ This solves three problems:
 
 The registry does NOT enforce a BaseSimEnv abstract class. Both
 IsaacDirectEnv and GazeboDirectEnv extend gym.Env directly with the
-same obs/action contract (Dict{"image": Box(90,160,3), "vec": Box(12,)},
+same obs/action contract (Dict{"image": Box(224,224,3), "vec": Box(12,)},
 action Box(3,)). The contract is enforced by convention and tests,
 not inheritance — matching the project's "no abstract base class layer"
 principle.
@@ -40,6 +40,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/31/26
+Updated: 05/15/26
 """
 
 import importlib

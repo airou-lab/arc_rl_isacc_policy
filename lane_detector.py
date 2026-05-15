@@ -49,13 +49,15 @@ class SimpleLaneDetector:
 
     def __init__(
         self,
-        img_width: int = 160,
-        img_height: int = 90,
+        img_width: int = 224,
+        img_height: int = 224,
         roi_top_ratio: float = 0.4,       # Focus on the lower 60% of image
         edge_threshold: int = 50,         # Canny edge threshold
-        min_lane_width_px: int = 25,      # Minimum lane width
-        max_lane_width_px: int = 125,     # Maximum lane width
-        center_tolerance_px: int = 19,    # Tolerance for "in lane"
+        # Pixel thresholds scaled from the prior 160x90 tuning (x1.4 horizontal).
+        # Re-tune empirically once the new render is live.
+        min_lane_width_px: int = 35,      # Minimum lane width (was 25 @ 160w)
+        max_lane_width_px: int = 175,     # Maximum lane width (was 125 @ 160w)
+        center_tolerance_px: int = 27,    # Tolerance for "in lane" (was 19 @ 160w)
     ):
         self.img_width = img_width
         self.img_height = img_height
@@ -196,10 +198,10 @@ class SemanticLaneDetector:
 
     def __init__(
         self,
-        img_width: int = 160,
-        img_height: int = 90,
+        img_width: int = 224,
+        img_height: int = 224,
         lane_label: int = 1,              # Semantic label for lane
-        center_tolerance_px: int = 19,    # Tolerance for "in lane"
+        center_tolerance_px: int = 27,    # Tolerance for "in lane" (was 19 @ 160w)
     ):
         self.img_width = img_width
         self.img_height = img_height
@@ -398,4 +400,3 @@ if __name__ == "__main__":
     print(f"  Lateral Offset: {result_offset.lateral_offset:.3f}")
 
     print("\n Lane detector test complete!")
-

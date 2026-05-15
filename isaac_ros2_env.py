@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Isaac Sim ROS2 Gym Environment
-==============================
 PURPOSE: Physical ARCPro deployment and live Isaac Sim integration tests.
          NOT for training - use isaac_direct_env.py for that
 
@@ -19,7 +18,9 @@ Publishes to:
 Camera: Intel RealSense D435i
     RGB native: 1920x1080 (16:9)
     Depth native: 1280x720 (16:9)
-    Downsampled to 160x90 preserving 16:9 aspect ratio.
+    Reshaped to 224x224 to match the ResNet-18 pretrained input size.
+    The 16:9 -> 1:1 transform applied here in sim must also be applied
+    on the real D435i RGB stream at deploy time.
 
 Observation vector (12 floats) - must match hierarchical_policy.py IDX_* constants:
     [0]  turn_bias     - High-level navigation command [-1, 1] (set via set_turn_bias())
@@ -42,7 +43,7 @@ Passive Visual Protocol:
 
 Author: Aaron
 Date: 02/12/26
-Updated: 03/10/26
+Updated: 05/15/26
 """
 
 import numpy as np
@@ -73,9 +74,11 @@ except ImportError:
 class IsaacROS2Config:
     """Configuration for Isaac Sim ROS2 Environment"""
 
-    # Image settings - RealSence D435i downsampled to 160x90 (16:9)
-    img_width: int = 160
-    img_height: int = 90
+    # Image settings - 224x224 to match canonical ResNet-18 ImageNet input.
+    # D435i is 16:9 natively; deploy preprocessing applies the same shape
+    # transform used in sim so train and deploy distributions match.
+    img_width: int = 224
+    img_height: int = 224
 
     # ROS2 topic names
     camera_topic: str = "/camera/image_raw"
@@ -110,7 +113,7 @@ class IsaacROS2Env(gym.Env):
     Gymnasium environment wrapping the physical ARCPro robot via ROS2.
 
     Subscribes to vehicle controller outputs:
-    - Camera image (RGB, 160x90) from Intel RealSense D435i
+    - Camera image (RGB, 224x224) from Intel RealSense D435i
     - Vehicle state (speed, steering) from AckermannController
 
     Enforces Passive Visual Protocol: geometric slots [2,8,9,10] are always zero so the policy cannot access GPS,
@@ -282,7 +285,7 @@ class IsaacROS2Env(gym.Env):
         Passive Visual Protocol slots are permanently zero.
 
         Returns dict with keys:
-        - "image": (90, 160, 3) uint8 RGB
+        - "image": (224, 224, 3) uint8 RGB
         - "vec": (12,) float32 telemetry
         """
         # Spin ROS2 to process callbacks

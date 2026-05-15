@@ -29,7 +29,7 @@ Tests everything that doesn't require Isaac Sim to be running:
     22. Syntax check all Python files
 
 Author: Aaron Hamil
-Updated: 04/23/26
+Updated: 05/15/26
 """
 
 import sys
@@ -83,9 +83,13 @@ def test_config_create():
     assert TELEMETRY_DIM == 12
     assert len(TELEMETRY_INDICES) == 12
     config = ExperimentConfig(name="test", method="rl")
-    assert config.sim.camera_width == 160
-    assert config.sim.camera_height == 90
+    assert config.sim.camera_width == 224
+    assert config.sim.camera_height == 224
     assert config.policy.lstm_hidden_size == 256
+    # Visual backbone defaults (standard ImageNet stem)
+    assert config.policy.visual_backbone == "resnet18"
+    assert config.policy.pretrained_visual is True
+    assert config.policy.cifar_stem is False
 
 test("Config creation + defaults", test_config_create)
 
@@ -761,7 +765,7 @@ def test_agent_prepare_obs():
     agent = AgentNode(graph=graph)
     agent.reset()
     agent.worker_step((50.0, 50.0), heading=0.0, speed=1.0, dt=0.1)
-    obs = {"image": np.zeros((90, 160, 3), dtype=np.uint8),
+    obs = {"image": np.zeros((224, 224, 3), dtype=np.uint8),
            "vec": np.zeros(12, dtype=np.float32)}
     prepared = agent.prepare_obs(obs)
     assert prepared["vec"][0] == 0.0  # STRAIGHT
@@ -809,7 +813,7 @@ def test_agent_wrapper_wraps_correctly():
     class DummyEnv(gym.Env):
         def __init__(self):
             self.observation_space = spaces.Dict({
-                "image": spaces.Box(0, 255, (90, 160, 3), dtype=np.uint8),
+                "image": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
                 "vec": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32),
             })
             self.action_space = spaces.Box(
@@ -817,7 +821,7 @@ def test_agent_wrapper_wraps_correctly():
                 np.array([1, 1, 1], dtype=np.float32),
             )
         def reset(self, **kw):
-            return {"image": np.zeros((90,160,3), dtype=np.uint8),
+            return {"image": np.zeros((224,224,3), dtype=np.uint8),
                     "vec": np.zeros(12, dtype=np.float32)}, {}
         def step(self, a):
             obs, info = self.reset()
@@ -1004,13 +1008,16 @@ if HAS_TORCH:
         from policies.fusion_policy import FusionFeaturesExtractor
         from gymnasium import spaces
         obs_space = spaces.Dict({
-            "image": spaces.Box(0, 255, (90, 160, 3), dtype=np.uint8),
+            "image": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
             "vec": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32),
         })
-        extractor = FusionFeaturesExtractor(obs_space)
-        assert extractor.features_dim == 268  # 256 CNN + 12 vec
+        # pretrained=False keeps the smoke suite hermetic (no torchvision
+        # weight download). Production training uses pretrained=True via
+        # train_policy_ros2.py CLI defaults.
+        extractor = FusionFeaturesExtractor(obs_space, pretrained=False)
+        assert extractor.features_dim == 268  # 256 visual + 12 vec
         obs = {
-            "image": torch.randn(2, 3, 90, 160),
+            "image": torch.randn(2, 3, 224, 224),
             "vec": torch.randn(2, 12),
         }
         out = extractor(obs)
@@ -1022,14 +1029,46 @@ if HAS_TORCH:
         from policies.fusion_policy import FusionFeaturesExtractor
         from gymnasium import spaces
         obs_space = spaces.Dict({
-            "image": spaces.Box(0, 255, (90, 160, 3), dtype=np.uint8),
+            "image": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
             "vec": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32),
         })
-        extractor = FusionFeaturesExtractor(obs_space)
+        extractor = FusionFeaturesExtractor(obs_space, pretrained=False)
         assert hasattr(extractor, 'fusion_norm'), "Missing LayerNorm"
         assert extractor.fusion_norm.normalized_shape == (268,)
 
     test("FusionFeaturesExtractor LayerNorm present", test_fusion_layernorm_present)
+
+    def test_fusion_resnet18_backbone_and_bn_eval():
+        """ResNet-18 backbone is wired in and BN stays in eval after .train(True)."""
+        import torch.nn as nn
+        from policies.fusion_policy import FusionFeaturesExtractor
+        from gymnasium import spaces
+        obs_space = spaces.Dict({
+            "image": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
+            "vec": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32),
+        })
+        extractor = FusionFeaturesExtractor(obs_space, pretrained=False)
+
+        # Backbone identity: torchvision ResNet
+        assert type(extractor.backbone).__name__ == "ResNet", (
+            f"Expected ResNet backbone, got {type(extractor.backbone).__name__}"
+        )
+
+        # BN must remain in eval after train(True) — critical RL property
+        extractor.train(True)
+        bn_modules = [
+            m for m in extractor.backbone.modules()
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))
+        ]
+        assert len(bn_modules) > 0, "Expected BatchNorm modules in ResNet-18"
+        for m in bn_modules:
+            assert not m.training, "BatchNorm must stay in eval mode in RL"
+
+        # Visual projection lands at 256 so fused dim stays 268
+        assert extractor.visual_proj[0].out_features == 256
+
+    test("FusionFeaturesExtractor ResNet-18 backbone + BN-eval discipline",
+         test_fusion_resnet18_backbone_and_bn_eval)
 
 
 # 18. HIERARCHICAL POLICY
@@ -1072,7 +1111,7 @@ if HAS_TORCH and HAS_SB3_CONTRIB:
         from policies.fusion_policy import FusionFeaturesExtractor
         from gymnasium import spaces
         obs_space = spaces.Dict({
-            "image": spaces.Box(0, 255, (90, 160, 3), dtype=np.uint8),
+            "image": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
             "vec": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32),
         })
         act_space = spaces.Box(
@@ -1083,6 +1122,7 @@ if HAS_TORCH and HAS_SB3_CONTRIB:
             action_space=act_space,
             lr_schedule=lambda _: 3e-4,
             features_extractor_class=FusionFeaturesExtractor,
+            features_extractor_kwargs=dict(pretrained=False),  # hermetic: no weight download
         )
 
     # Check if policy construction works with this SB3 version
@@ -1235,7 +1275,7 @@ def test_waypoint_wrapper_safety_backfill():
     class CrashEnv(gym.Env):
         def __init__(self):
             self.observation_space = spaces.Dict({
-                "image": spaces.Box(0, 255, (90, 160, 3), dtype=np.uint8),
+                "image": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
                 "vec": spaces.Box(-np.inf, np.inf, (12,), dtype=np.float32),
             })
             self.action_space = spaces.Box(
@@ -1245,13 +1285,13 @@ def test_waypoint_wrapper_safety_backfill():
             self._steps = 0
         def reset(self, **kw):
             self._steps = 0
-            return {"image": np.zeros((90,160,3), dtype=np.uint8),
+            return {"image": np.zeros((224,224,3), dtype=np.uint8),
                     "vec": np.zeros(12, dtype=np.float32)}, {}
         def step(self, a):
             self._steps += 1
             done = self._steps >= 50
             reward = -10.0 if done else 0.1
-            obs = {"image": np.zeros((90,160,3), dtype=np.uint8),
+            obs = {"image": np.zeros((224,224,3), dtype=np.uint8),
                    "vec": np.zeros(12, dtype=np.float32)}
             obs["vec"][3] = 1.0  # speed
             return obs, reward, done, False, {}

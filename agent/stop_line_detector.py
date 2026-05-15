@@ -33,13 +33,21 @@ Pixel-to-ground projection (visual variant):
     Camera intrinsics come from IsaacDirectEnv / ARCProSceneCfg:
         horizontal_aperture = 2.65
         focal_length        = 1.93
-        image size          = 160 x 90
+        image size          = 224 x 224 (resized from 16:9 source)
         height above ground ~ 0.20 m (chassis + mount)
         pitch               = 0 (level forward)
     All configurable via StopLineDetectorConfig.
 
+    NOTE: The 16:9 -> 1:1 reshape changes the effective vertical FOV
+    relative to the physical D435i sensor. The derived vertical_aperture
+    property uses img_height / img_width which equals 1.0 at 224x224 —
+    it no longer reflects the physical sensor. Pixel-to-ground projection
+    math here assumes square pixels in the resized image; calibration
+    should be re-validated against the deploy preprocessing transform.
+
 Author: Aaron Hamil
 Date: 04/20/26
+Updated: 05/15/26
 """
 
 from __future__ import annotations
@@ -166,8 +174,8 @@ class StopLineDetectorConfig:
     Attributes (output):
         min_confidence: Below this confidence, reports detected=False.
     """
-    img_width: int = 160
-    img_height: int = 90
+    img_width: int = 224
+    img_height: int = 224
     horizontal_aperture: float = 2.65
     focal_length: float = 1.93
     camera_height_m: float = 0.20
@@ -175,8 +183,12 @@ class StopLineDetectorConfig:
 
     roi_top_ratio: float = 0.5
     white_threshold: int = 200
-    min_line_width_px: int = 40
-    max_line_thickness_px: int = 8
+    # Pixel thresholds scaled from the prior 160x90 tuning:
+    # min_line_width_px:   40 -> 56 (x1.4 horizontal scale, 224/160)
+    # max_line_thickness_px: 8 -> 20 (x2.49 vertical scale, 224/90)
+    # Both should be re-tuned empirically once the new render is live.
+    min_line_width_px: int = 56
+    max_line_thickness_px: int = 20
     min_fraction: float = 0.35
 
     min_confidence: float = 0.3

@@ -207,6 +207,26 @@ def main():
     parser.add_argument("--waypoint-horizon", type=float, default=2.5, help="Planning horizon (meters)")
     parser.add_argument("--no-kinematic-anchors", action="store_true", help="Disable kinematic anchors (ablation)")
 
+    # Visual backbone (FusionFeaturesExtractor)
+    parser.add_argument(
+        "--visual-backbone", type=str, default="resnet18",
+        choices=["resnet18"],
+        help="Visual backbone in the fusion extractor (only resnet18 supported today)",
+    )
+    parser.add_argument(
+        "--no-pretrained-visual", action="store_true",
+        help="Disable ImageNet-pretrained weights on the visual backbone (from-scratch ablation)",
+    )
+    parser.add_argument(
+        "--cifar-stem", action="store_true",
+        help="Replace ResNet stem with the small-input 3x3 s=1 variant. Default off "
+             "(Option A uses the standard ImageNet stem at 224x224)",
+    )
+    parser.add_argument(
+        "--freeze-visual-backbone", action="store_true",
+        help="Freeze the ResNet backbone; only the projection + heads train",
+    )
+
     # Device
     parser.add_argument("--device", type=str, default="auto", help="Device: auto, cpu, cuda")
 
@@ -227,7 +247,7 @@ def main():
     print(f"  TensorBoard: tensorboard --logdir {tb_dir}")
     print(f"  Timesteps: {args.timesteps:,}")
 
-    # ── Intersection Graph ────────────────────────────────────────
+    # Intersection Graph
     # Load topology (connectivity only, no positions/lengths)
     graph = IntersectionGraph.from_json(args.topology)
     print(f"  Topology: {graph}")
@@ -242,14 +262,14 @@ def main():
     else:
         print(f"  Geometry: no cache found — will calibrate incrementally during training")
 
-    # ── Agent Configuration ───────────────────────────────────────
+    # Agent Configuration
     agent_config = AgentConfig(
         agent_id="agent_0",
         worker=WorkerConfig(mode=args.worker_mode),
     )
     print(f"  Worker mode: {args.worker_mode}")
 
-    # ── Environment ───────────────────────────────────────────────
+    # Environment
     env_config = IsaacDirectConfig(
         img_width=160,
         img_height=90,
@@ -272,7 +292,13 @@ def main():
     else:
         policy_kwargs = dict(
             features_extractor_class=FusionFeaturesExtractor,
-            features_extractor_kwargs=dict(features_dim=268),
+            features_extractor_kwargs=dict(
+                features_dim=268,
+                backbone=args.visual_backbone,
+                pretrained=not args.no_pretrained_visual,
+                cifar_stem=args.cifar_stem,
+                freeze_backbone=args.freeze_visual_backbone,
+            ),
             lstm_hidden_size=args.lstm_size,
             n_lstm_layers=1,
             enable_critic_lstm=True,

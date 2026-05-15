@@ -62,8 +62,14 @@ class IsaacDirectConfig:
     reward_mode: str = "original"
 
     # Camera
-    img_width: int = 160
-    img_height: int = 90
+    # 224x224 matches the canonical ResNet-18 ImageNet input size, so the
+    # pretrained backbone in policies/fusion_policy.py receives input at
+    # the resolution its weights were trained for. The D435i is natively
+    # 16:9 (1.78); deploy-time preprocessing must apply the same shape
+    # transform (e.g. center-crop to square) so train and deploy
+    # distributions match.
+    img_width: int = 224
+    img_height: int = 224
 
     # Vehicle Geometry
     # From f1tenth.xacro: wheelbase 0.3302 m, track 0.2413 m, wheel_r 0.0508 m.

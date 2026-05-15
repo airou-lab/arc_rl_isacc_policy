@@ -24,7 +24,7 @@ Dependencies:
 
 Author: Aaron Hamil
 Date: 03/31/26
-Updated: 04/016/26
+Updated: 05/15/26
 """
 
 from dataclasses import dataclass, field, asdict
@@ -64,9 +64,13 @@ class SimConfig:
     timestep, and parallelization. The sim_type field selects the
     environment adapter via the registry (when implemented).
 
-    Camera resolution is fixed at 160x90 (16:9) to match the D435i
-    downsampled output. Changing this requires recomputing CNN dimensions
-    in FusionFeaturesExtractor.
+    Camera resolution is fixed at 224x224 to match the canonical
+    ResNet-18 ImageNet input size, so the pretrained backbone in
+    FusionFeaturesExtractor receives input at the resolution its
+    weights were trained for. The D435i is 16:9 natively; the train
+    and deploy preprocessing pipelines must apply the same shape
+    transform (e.g. center-crop to square, then resize to 224) so
+    the two distributions match.
     """
 
     # Simulator selection (used by future registry/factory)
@@ -74,8 +78,8 @@ class SimConfig:
 
     # Rendering
     headless: bool = True
-    camera_width: int = 160
-    camera_height: int = 90
+    camera_width: int = 224
+    camera_height: int = 224
 
     # Physics
     # Aligned with sim repo: 500 Hz physics, 20 Hz control (500/25)
@@ -159,9 +163,13 @@ class PolicyConfig:
     """
 
     # Feature extraction
-    cnn_features_dim: int = 256           # CNN output dimension
+    visual_backbone: str = "resnet18"     # FusionFeaturesExtractor visual stream
+    pretrained_visual: bool = True        # Load ImageNet-pretrained weights
+    cifar_stem: bool = False              # Standard ImageNet stem (Option A default)
+    freeze_visual_backbone: bool = False  # If True, only the projection + heads train
+    cnn_features_dim: int = 256           # Visual projection output dimension
     vec_features_dim: int = TELEMETRY_DIM # Telemetry vector dimension
-    fusion_features_dim: int = 268        # cnn + vec = 256 + 12
+    fusion_features_dim: int = 268        # visual_proj + vec = 256 + 12
 
     # Temporal backbone
     temporal_backbone: str = "lstm"       # "lstm" | (future)
